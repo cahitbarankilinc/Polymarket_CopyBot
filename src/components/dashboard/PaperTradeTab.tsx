@@ -1,0 +1,1869 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  ArrowDownRight,
+  ArrowUpRight,
+  ChevronDown,
+  ChevronUp,
+  Pause,
+  Play,
+  RotateCcw,
+  Wallet,
+} from 'lucide-react';
+import { useDashboard, type CopyMode } from '@/context/DashboardContext';
+import {
+  clearOrderHistory,
+  getMarketQuote,
+  getOrderHistory,
+  getOrderStats,
+  getWalletEventsWithStats,
+  listCopySessions,
+  startCopySession,
+  stopCopySession,
+  type OrderStatsResponse,
+  type TrackerMonitorRecord,
+  type WalletTrackerEvent,
+} from '@/lib/polymarketTrackerApi';
+import { Scatter, ScatterChart, ResponsiveContainer, XAxis, YAxis, CartesianGrid, Tooltip } from 'recharts';
+import { toast } from 'sonner';
+
+const COPY_MODE_OPTIONS: Array<{ value: CopyMode; label: string; description: string }> = [
+  { value: 'notional', label: '1e1 Direct Copy', description: 'Onun aldığı USD kadar al.' },
+  { value: 'proportional', label: 'Proportional to Free Balance', description: 'Boştaki bakiyeye göre oranla.' },
+  { value: 'multiplier', label: 'Multiplier Mode', description: 'Onun trade tutarı × k.' },
+  { value: 'fixed-amount', label: 'Fixed USD Trade', description: 'Her işlemde sabit USD.' },
+  { value: 'buy-wait', label: 'X-Time copy', description: 'Her markette ilk N alımı sabit USD ile kopyala.' },
+];
+
+const getCopyModeLabel = (mode: CopyMode): string => (
+  COPY_MODE_OPTIONS.find((option) => option.value === mode)?.label || 'Copy Trading'
+);
+
+interface WalletModeConfig {
+  mode: CopyMode;
+  sourceTradeUsd: string;
+  leaderFreeBalance: string;
+  multiplier: string;
+  fixedAmount: string;
+  buyWaitLimit: string;
+  fixedShares: string;
+  sharePrice: string;
+  slippageCents: string;
+  useSlippage: boolean;
+  centRangeMin: string;
+  centRangeMax: string;
+  shareRangeMin: string;
+  shareRangeMax: string;
+  strategy: string;
+  direction: 'long' | 'short';
+}
+
+const defaultConfig: WalletModeConfig = {
+  mode: 'notional',
+  sourceTradeUsd: '100',
+  leaderFreeBalance: '1000',
+  multiplier: '1',
+  fixedAmount: '20',
+  buyWaitLimit: '2',
+  fixedShares: '50',
+  sharePrice: '1',
+  slippageCents: '5',
+  useSlippage: true,
+  centRangeMin: '',
+  centRangeMax: '',
+  shareRangeMin: '',
+  shareRangeMax: '',
+  strategy: getCopyModeLabel('notional'),
+  direction: 'long',
+};
+
+const formatUsd = (value: number) => `$${value.toLocaleString('tr-TR', { maximumFractionDigits: 2 })}`;
+const formatDate = (value: Date) => value.toLocaleString('tr-TR', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+const formatDateFromIso = (value?: string | null) => {
+  if (!value) return '-';
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return '-';
+  return parsed.toLocaleString('tr-TR', {
+    day: '2-digit',
+    month: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  });
+};
+const MAX_TRADES_FOR_CHART = 100;
+
+const parseNumberFromText = (value?: string | null): number | undefined => {
+  if (!value) return undefined;
+  const match = value.match(/[-+]?\d[\d.,]*/g);
+  if (!match?.length) return undefined;
+
+  const raw = match[match.length - 1].replace(/[^\d.,-]/g, '');
+  if (!raw) return undefined;
+
+  const commaCount = (raw.match(/,/g) || []).length;
+  const dotCount = (raw.match(/\./g) || []).length;
+
+  let normalized = raw;
+
+  if (commaCount > 0 && dotCount > 0) {
+    const lastComma = raw.lastIndexOf(',');
+    const lastDot = raw.lastIndexOf('.');
+
+    normalized = lastDot > lastComma
+      ? raw.replace(/,/g, '')
+      : raw.replace(/\./g, '').replace(',', '.');
+  } else if (commaCount > 0) {
+    if (commaCount > 1) {
+      normalized = raw.replace(/,/g, '');
+    } else {
+      const [, fraction = ''] = raw.split(',');
+      normalized = fraction.length === 3 ? raw.replace(/,/g, '') : raw.replace(',', '.');
+    }
+  } else if (dotCount > 1) {
+    normalized = raw.replace(/\./g, '');
+  }
+
+  const parsed = Number(normalized);
+  return Number.isFinite(parsed) ? parsed : undefined;
+};
+
+const resolveLeaderFreeBalance = (value?: string | null): number | undefined => parseNumberFromText(value);
+
+const resolveDirection = (event: WalletTrackerEvent | undefined): 'long' | 'short' | undefined => {
+  if (!event) return undefined;
+  const outcome = (event.outcome ?? '').toLowerCase();
+  if (outcome.includes('down') || outcome.includes('no')) return 'short';
+  if (outcome.includes('up') || outcome.includes('yes')) return 'long';
+
+  const side = (event.side ?? '').toLowerCase();
+  if (side === 'sell') return 'short';
+  if (side === 'buy') return 'long';
+  return undefined;
+};
+
+const resolveEventSide = (event: WalletTrackerEvent | undefined): 'BUY' | 'SELL' | undefined => {
+  if (!event?.side) return undefined;
+  const side = event.side.toUpperCase();
+  if (side === 'BUY' || side === 'SELL') return side;
+  return undefined;
+};
+
+const isTradeEvent = (event: WalletTrackerEvent | undefined): boolean => {
+  const type = (event?.type ?? '').trim().toUpperCase();
+  return type === 'TRADE';
+};
+
+interface PaperTradePrefill {
+  sourceTradeUsd?: number;
+  sharePrice?: number;
+  fixedShares?: number;
+  direction?: 'long' | 'short';
+  leaderFreeBalance?: number;
+}
+
+interface BudgetDraft {
+  mode: 'unlimited' | 'limited';
+  type: 'daily' | 'total';
+  amount: number;
+}
+
+interface TradeActivity {
+  id: string;
+  side: 'BUY' | 'SELL';
+  occurredAt: Date;
+  market: string;
+  marketSlug?: string;
+  outcome: string;
+  price: number;
+  share: number;
+  usd: number;
+}
+
+interface ActivityQuoteState {
+  benchmarkPrice: number;
+  diffPrice: number;
+  benchmarkLabel: 'Ask' | 'Bid';
+}
+
+interface CopySessionState {
+  addressId: string;
+  strategy: string;
+  startedAt: Date;
+  status: 'idle' | 'running' | 'syncing';
+  lastEventKey?: string;
+  marketBuyCounts?: Record<string, number>;
+}
+
+interface TrackingHistoryItem {
+  id: string;
+  addressId: string;
+  startedAt: Date;
+  walletName: string;
+  walletAddress?: string;
+  strategy: string;
+  stoppedAt: Date;
+}
+
+const resolveMarketKey = (event: WalletTrackerEvent): string | null => {
+  const market = typeof event.market === 'string' ? event.market.trim().toLowerCase() : '';
+  return market || null;
+};
+
+const TRACKER_POLL_MS = 1000;
+const TRACKER_EVENTS_LIMIT = 250;
+const QUOTE_RETRY_DELAY_MS = 500;
+const QUOTE_MAX_ATTEMPTS = 3;
+
+const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const formatPrice = (value: number) => value.toLocaleString('tr-TR', { maximumFractionDigits: 4 });
+
+const formatSignedPrice = (value: number) => `${value > 0 ? '+' : ''}${value.toLocaleString('tr-TR', { maximumFractionDigits: 4 })}`;
+
+const getOrderStatusMeta = (statusRaw?: string | null) => {
+  const status = (statusRaw ?? '').trim().toLowerCase();
+  if (status === 'matched') return { icon: '✅', label: 'matched', className: 'text-emerald-600' };
+  if (status === 'live') return { icon: '☑️', label: 'live', className: 'text-sky-600' };
+  if (status === 'error' || status === 'blocked') return { icon: '❌', label: status || 'error', className: 'text-destructive' };
+  if (status === 'pending') return { icon: '⏳', label: 'pending', className: 'text-amber-600' };
+  return { icon: '⏳', label: status || 'pending', className: 'text-muted-foreground' };
+};
+
+const stringifyJson = (value: unknown): string => {
+  if (value === null || value === undefined) return '-';
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+};
+
+const parseSlippageCents = (value: string | undefined): number => {
+  const parsed = Number.parseFloat(value ?? '');
+  if (!Number.isFinite(parsed) || parsed < 0) return 0;
+  return parsed;
+};
+
+const normalizeStrategyName = (value: string | undefined): string => {
+  const trimmed = (value ?? '').trim();
+  return trimmed || defaultConfig.strategy;
+};
+
+const buildSessionKey = (addressId: string, strategy: string): string => `${addressId}::${normalizeStrategyName(strategy)}`;
+
+const parseOptionalNumber = (value: string | undefined): number | null => {
+  const trimmed = (value ?? '').trim();
+  if (!trimmed) return null;
+  const parsed = Number(trimmed);
+  return Number.isFinite(parsed) ? parsed : Number.NaN;
+};
+
+const validateRangeConfig = (config: WalletModeConfig): string | null => {
+  const centMin = parseOptionalNumber(config.centRangeMin);
+  const centMax = parseOptionalNumber(config.centRangeMax);
+
+  if (centMin !== null && !Number.isFinite(centMin)) return 'Alınacak Cent Aralığı sayısal olmalı.';
+  if (centMax !== null && !Number.isFinite(centMax)) return 'Alınacak Cent Aralığı sayısal olmalı.';
+
+  const resolvedCentMin = centMin ?? 1;
+  const resolvedCentMax = centMax ?? 99;
+  if (resolvedCentMin < 1 || resolvedCentMin > 99 || resolvedCentMax < 1 || resolvedCentMax > 99) {
+    return 'Alınacak Cent Aralığı 1 ile 99 arasında olmalı.';
+  }
+  if (resolvedCentMax < resolvedCentMin) return 'Alınacak Cent Aralığında ikinci kutu ilk kutudan küçük olamaz.';
+
+  const shareMin = parseOptionalNumber(config.shareRangeMin);
+  const shareMax = parseOptionalNumber(config.shareRangeMax);
+  if (shareMin !== null && !Number.isFinite(shareMin)) return 'Alınacak Share Aralığı sayısal olmalı.';
+  if (shareMax !== null && !Number.isFinite(shareMax)) return 'Alınacak Share Aralığı sayısal olmalı.';
+
+  const resolvedShareMin = shareMin ?? 0;
+  const resolvedShareMax = shareMax ?? Number.POSITIVE_INFINITY;
+  if (resolvedShareMin < 0 || (Number.isFinite(resolvedShareMax) && resolvedShareMax < 0)) return 'Alınacak Share Aralığı negatif olamaz.';
+  if (resolvedShareMax < resolvedShareMin) return 'Alınacak Share Aralığında ikinci kutu ilk kutudan küçük olamaz.';
+
+  return null;
+};
+
+const isEventInConfiguredRanges = (eventPrice: number, eventSize: number, config: WalletModeConfig): boolean => {
+  const centMin = parseOptionalNumber(config.centRangeMin);
+  const centMax = parseOptionalNumber(config.centRangeMax);
+  const resolvedCentMin = Number.isFinite(centMin ?? Number.NaN) ? (centMin as number) : 1;
+  const resolvedCentMax = Number.isFinite(centMax ?? Number.NaN) ? (centMax as number) : 99;
+  const priceCents = Math.round(eventPrice * 100);
+  if (priceCents < resolvedCentMin || priceCents > resolvedCentMax) return false;
+
+  const shareMin = parseOptionalNumber(config.shareRangeMin);
+  const shareMax = parseOptionalNumber(config.shareRangeMax);
+  const resolvedShareMin = Number.isFinite(shareMin ?? Number.NaN) ? (shareMin as number) : 0;
+  const resolvedShareMax = Number.isFinite(shareMax ?? Number.NaN) ? (shareMax as number) : Number.POSITIVE_INFINITY;
+  if (eventSize < resolvedShareMin || eventSize > resolvedShareMax) return false;
+
+  return true;
+};
+
+const normalizeCentInputOnBlur = (value: string): string => {
+  const trimmed = value.trim();
+  if (!trimmed) return '';
+  const parsed = Math.round(Number(trimmed));
+  if (!Number.isFinite(parsed)) return '';
+  return String(Math.min(99, Math.max(1, parsed)));
+};
+
+const normalizeShareInputOnBlur = (value: string): string => {
+  const trimmed = value.trim();
+  if (!trimmed) return '';
+  const parsed = Number(trimmed);
+  if (!Number.isFinite(parsed)) return '';
+  return String(Math.max(0, parsed));
+};
+
+
+const describeSessionConfig = (config: WalletModeConfig): string => {
+  const modeLabel = COPY_MODE_OPTIONS.find((option) => option.value === config.mode)?.label || config.mode;
+
+  let modeDetail = '';
+  if (config.mode === 'multiplier') modeDetail = `Multiplier: ${config.multiplier || '-'}`;
+  else if (config.mode === 'fixed-amount') modeDetail = `Sabit Tutar: $${config.fixedAmount || '-'}`;
+  else if (config.mode === 'buy-wait') modeDetail = `Buy-Wait Limit: ${config.buyWaitLimit || '-'} • Sabit Tutar: $${config.fixedAmount || '-'}`;
+  else if (config.mode === 'proportional') modeDetail = `Leader Bakiye: $${config.leaderFreeBalance || '-'}`;
+  else modeDetail = `Kaynak Trade: $${config.sourceTradeUsd || '-'}`;
+
+  const slippage = config.slippageCents || '0';
+  const centRangeLabel = `${config.centRangeMin || '1'}-${config.centRangeMax || '99'}¢`;
+  const shareRangeLabel = `${config.shareRangeMin || '2'}-${config.shareRangeMax || '∞'}`;
+  return `Opsiyon: ${modeLabel} • ${modeDetail} • Slippage: ${slippage}¢ • Cent: ${centRangeLabel} • Share: ${shareRangeLabel}`;
+};
+
+const toEventTimestamp = (event: WalletTrackerEvent): number => {
+  const candidates = [event.event_time, event.seen_at_utc];
+
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    const normalized = typeof candidate === 'string' ? candidate.trim() : String(candidate);
+    if (!normalized) continue;
+
+    if (/^\d+(?:\.\d+)?$/.test(normalized)) {
+      const numeric = Number(normalized);
+      if (!Number.isFinite(numeric)) continue;
+      return numeric > 1e12 ? numeric : numeric * 1000;
+    }
+
+    const parsed = new Date(normalized).getTime();
+    if (!Number.isNaN(parsed)) return parsed;
+  }
+
+  return 0;
+};
+
+const sortEventsOldestFirst = (events: WalletTrackerEvent[]) => (
+  [...events].sort((a, b) => toEventTimestamp(a) - toEventTimestamp(b))
+);
+
+const getLatestEvent = (events: WalletTrackerEvent[]) => {
+  if (!events.length) return undefined;
+  return sortEventsOldestFirst(events).at(-1);
+};
+
+const toPositiveNumber = (value: unknown): number => {
+  if (typeof value === 'number' && Number.isFinite(value) && value > 0) return value;
+  if (typeof value === 'string') {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  return 0;
+};
+
+const resolveEventTradeUsd = (event: WalletTrackerEvent, fallbackUsd: number): number => {
+  const directUsd = toPositiveNumber(event.value_usd);
+  if (directUsd > 0) return directUsd;
+
+  const size = toPositiveNumber(event.size);
+  const price = toPositiveNumber(event.price);
+  const calculatedUsd = size * price;
+  if (calculatedUsd > 0) return calculatedUsd;
+
+  return fallbackUsd > 0 ? fallbackUsd : 0;
+};
+
+const getEventKey = (event: WalletTrackerEvent): string => (
+  event.tx_hash
+  || `${event.seen_at_utc}:${event.market ?? ''}:${event.side ?? ''}:${event.value_usd ?? ''}:${event.price ?? ''}`
+);
+
+export default function PaperTradeTab({
+  preselectedId,
+  prefill,
+  mode = 'paper',
+}: {
+  preselectedId?: string | null;
+  prefill?: PaperTradePrefill | null;
+  mode?: 'paper' | 'real';
+}) {
+  const isRealMode = mode === 'real';
+  const { addresses, paperTrades, startPaperTrade, paperBudget, setPaperBudget } = useDashboard();
+  const [setupId, setSetupId] = useState<string | null>(preselectedId || null);
+  const [setupStrategy, setSetupStrategy] = useState(defaultConfig.strategy);
+  const [collapsed, setCollapsed] = useState(false);
+  const [budgetMode, setBudgetMode] = useState<'unlimited' | 'limited'>(paperBudget.mode);
+  const [budgetType, setBudgetType] = useState<'daily' | 'total'>(paperBudget.type);
+  const [budgetAmount, setBudgetAmount] = useState(paperBudget.amount > 0 ? String(paperBudget.amount) : '1000');
+  const [virtualFreeBalance, setVirtualFreeBalance] = useState('1000');
+  const [walletConfigs, setWalletConfigs] = useState<Record<string, WalletModeConfig>>({});
+  const [copySessions, setCopySessions] = useState<Record<string, CopySessionState>>({});
+  const [copySessionErrors, setCopySessionErrors] = useState<Record<string, string | null>>({});
+  const view = 'paper' as const;
+  const analysisAddressId: string | null = null;
+  const analysisStrategy: string | null = null;
+  const analysisStartedAt: Date | null = null;
+  const [visibleActivityCount, setVisibleActivityCount] = useState(20);
+  const [activityQuotes, setActivityQuotes] = useState<Record<string, ActivityQuoteState>>({});
+  const [trackingHistory, setTrackingHistory] = useState<TrackingHistoryItem[]>([]);
+  const [orderHistoryRows, setOrderHistoryRows] = useState<TrackerMonitorRecord[]>([]);
+  const [orderStats, setOrderStats] = useState<OrderStatsResponse | null>(null);
+  const [isClearingOrderHistory, setIsClearingOrderHistory] = useState(false);
+  const copySessionsRef = useRef(copySessions);
+  const walletConfigsRef = useRef(walletConfigs);
+  const syncingWalletsRef = useRef<Set<string>>(new Set());
+  const activeConfigKey = setupId ? buildSessionKey(setupId, setupStrategy) : null;
+
+  useEffect(() => {
+    copySessionsRef.current = copySessions;
+  }, [copySessions]);
+
+  useEffect(() => {
+    walletConfigsRef.current = walletConfigs;
+  }, [walletConfigs]);
+
+  useEffect(() => {
+    if (!isRealMode) return;
+    let active = true;
+    let timer: number | undefined;
+
+    const tick = async () => {
+      try {
+        const [sessionPayload, historyPayload, statsPayload] = await Promise.all([
+          listCopySessions().catch(() => ({ sessions: [] })),
+          getOrderHistory(200).catch(() => ({ records: [] })),
+          getOrderStats(200).catch(() => null),
+        ]);
+
+        if (!active) return;
+
+        const sessionsMap: Record<string, CopySessionState> = {};
+        for (const item of sessionPayload.sessions) {
+          const sessionKey = buildSessionKey(item.addressId, item.strategy);
+          sessionsMap[sessionKey] = {
+            addressId: item.addressId,
+            strategy: item.strategy,
+            startedAt: new Date(item.startedAt),
+            status: item.status === 'syncing' ? 'syncing' : (item.status === 'running' ? 'running' : 'idle'),
+            marketBuyCounts: {},
+          };
+        }
+        setCopySessions(sessionsMap);
+        setOrderHistoryRows(Array.isArray(historyPayload.records) ? historyPayload.records : []);
+        setOrderStats(statsPayload);
+      } finally {
+        if (active) {
+          timer = window.setTimeout(() => {
+            void tick();
+          }, 1000);
+        }
+      }
+    };
+
+    void tick();
+    return () => {
+      active = false;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [isRealMode]);
+
+  const loadAutoConfig = async (addressId: string, strategy: string): Promise<WalletModeConfig | null> => {
+    const targetAddress = addresses.find((address) => address.id === addressId);
+    if (!targetAddress) return null;
+
+    const sessionKey = buildSessionKey(addressId, strategy);
+    const snapshotBaseConfig = walletConfigsRef.current[sessionKey] || { ...defaultConfig, strategy: normalizeStrategyName(strategy) };
+
+    try {
+      const payload = await getWalletEventsWithStats(targetAddress.address, { limit: TRACKER_EVENTS_LIMIT });
+      const latestEvent = getLatestEvent(payload.events);
+      let resolvedConfig: WalletModeConfig = snapshotBaseConfig;
+
+      setWalletConfigs((prev) => {
+        const liveBaseConfig = prev[sessionKey] || snapshotBaseConfig;
+        const nextConfig: WalletModeConfig = {
+          ...liveBaseConfig,
+          sourceTradeUsd: String(latestEvent?.value_usd ?? liveBaseConfig.sourceTradeUsd),
+          sharePrice: String(latestEvent?.price ?? liveBaseConfig.sharePrice),
+          fixedShares: String(latestEvent?.size ?? liveBaseConfig.fixedShares),
+          direction: resolveDirection(latestEvent) ?? liveBaseConfig.direction,
+          leaderFreeBalance: String(resolveLeaderFreeBalance(targetAddress.polygonscanTopTotalValText) ?? liveBaseConfig.leaderFreeBalance),
+        };
+        resolvedConfig = nextConfig;
+        return { ...prev, [sessionKey]: nextConfig };
+      });
+
+      return resolvedConfig;
+    } catch {
+      let resolvedConfig: WalletModeConfig = snapshotBaseConfig;
+      setWalletConfigs((prev) => {
+        const liveBaseConfig = prev[sessionKey] || snapshotBaseConfig;
+        const nextConfig: WalletModeConfig = {
+          ...liveBaseConfig,
+          leaderFreeBalance: String(resolveLeaderFreeBalance(targetAddress.polygonscanTopTotalValText) ?? liveBaseConfig.leaderFreeBalance),
+        };
+        resolvedConfig = nextConfig;
+        return { ...prev, [sessionKey]: nextConfig };
+      });
+      return resolvedConfig;
+    }
+  };
+
+  useEffect(() => {
+    if (preselectedId) {
+      setSetupId(preselectedId);
+      setSetupStrategy(defaultConfig.strategy);
+      setCollapsed(false);
+    }
+  }, [preselectedId]);
+
+  useEffect(() => {
+    if (setupId || preselectedId || addresses.length === 0) return;
+    setSetupId(addresses[0].id);
+  }, [addresses, preselectedId, setupId]);
+
+  useEffect(() => {
+    if (!setupId || !prefill) return;
+
+    const patch: Partial<WalletModeConfig> = {};
+    if (typeof prefill.sourceTradeUsd === 'number' && Number.isFinite(prefill.sourceTradeUsd)) patch.sourceTradeUsd = String(prefill.sourceTradeUsd);
+    if (typeof prefill.sharePrice === 'number' && Number.isFinite(prefill.sharePrice)) patch.sharePrice = String(prefill.sharePrice);
+    if (typeof prefill.fixedShares === 'number' && Number.isFinite(prefill.fixedShares)) patch.fixedShares = String(prefill.fixedShares);
+    if (typeof prefill.leaderFreeBalance === 'number' && Number.isFinite(prefill.leaderFreeBalance)) patch.leaderFreeBalance = String(prefill.leaderFreeBalance);
+    if (prefill.direction) patch.direction = prefill.direction;
+
+    if (Object.keys(patch).length) {
+      const sessionKey = buildSessionKey(setupId, setupStrategy);
+      setWalletConfigs(prev => ({ ...prev, [sessionKey]: { ...(prev[sessionKey] || { ...defaultConfig, strategy: normalizeStrategyName(setupStrategy) }), ...patch } }));
+    }
+  }, [setupId, setupStrategy, prefill]);
+
+  useEffect(() => {
+    if (!setupId) return;
+    loadAutoConfig(setupId, setupStrategy);
+  }, [setupId, addresses]);
+
+  const currentConfig = activeConfigKey ? (walletConfigs[activeConfigKey] || { ...defaultConfig, strategy: normalizeStrategyName(setupStrategy) }) : defaultConfig;
+
+  useEffect(() => {
+    if (currentConfig.mode !== 'proportional') return;
+
+    if (budgetMode !== 'limited') setBudgetMode('limited');
+
+    const parsedBudgetAmount = parseFloat(budgetAmount) || 0;
+    if (parsedBudgetAmount <= 0 || budgetAmount === '1000') setBudgetAmount('100');
+  }, [budgetAmount, budgetMode, currentConfig.mode]);
+
+  const myDynamicFreeBalance = useMemo(() => {
+    if (paperBudget.mode === 'limited') return paperBudget.remaining;
+    return parseFloat(virtualFreeBalance) || 0;
+  }, [paperBudget.mode, paperBudget.remaining, virtualFreeBalance]);
+
+  const tradesWithAddress = useMemo(() => paperTrades.map((trade) => {
+    const wallet = addresses.find((addr) => addr.id === trade.addressId);
+    const walletName = wallet?.username || wallet?.label || trade.address;
+    const spendUsd = trade.spentUsd || 0;
+    const isSellSide = trade.side === 'SELL';
+    return {
+      ...trade,
+      walletName,
+      marketLabel: `${trade.strategy || defaultConfig.strategy} • ${walletName}`,
+      buyUsd: isSellSide ? 0 : spendUsd,
+      sellUsd: isSellSide ? spendUsd : (trade.status === 'closed' ? trade.currentPrice * trade.amount : 0),
+    };
+  }), [addresses, paperTrades]);
+
+  const activeTrades = tradesWithAddress.filter(t => t.status === 'active');
+  const closedTrades = tradesWithAddress.filter(t => t.status === 'closed');
+
+  const getSessionActiveTradeCount = useCallback((addressId: string, strategy: string, startedAt: Date) => (
+    activeTrades.filter((trade) => {
+      if (trade.addressId !== addressId) return false;
+      if (trade.strategy !== strategy) return false;
+      return new Date(trade.startedAt).getTime() >= startedAt.getTime();
+    }).length
+  ), [activeTrades]);
+  const runningSessions = useMemo(() => Object.entries(copySessions)
+    .filter(([, session]) => session.status !== 'idle')
+    .map(([sessionKey, session]) => {
+      const wallet = addresses.find((addr) => addr.id === session.addressId);
+      return {
+        sessionKey,
+        addressId: session.addressId,
+        session,
+        strategy: session.strategy,
+        startedAt: session.startedAt,
+        walletName: wallet?.username || wallet?.label || wallet?.address || session.addressId,
+        walletAddress: wallet?.address,
+      };
+    }), [addresses, copySessions]);
+  const passiveSessions = useMemo(() => addresses
+    .filter((wallet) => !Object.values(copySessions).some((session) => (
+      session.addressId === wallet.id && (session.status === 'running' || session.status === 'syncing')
+    )))
+    .map((wallet) => ({
+      addressId: wallet.id,
+      strategy: defaultConfig.strategy,
+      walletName: wallet.username || wallet.label || wallet.address || wallet.id,
+      walletAddress: wallet.address,
+    })), [addresses, copySessions]);
+
+  const analysisTrades = useMemo(
+    () => {
+      if (!analysisAddressId) return [];
+      return tradesWithAddress.filter((trade) => {
+      if (trade.addressId !== analysisAddressId) return false;
+      if (analysisStartedAt && new Date(trade.startedAt).getTime() < analysisStartedAt.getTime()) return false;
+      if (!analysisStrategy) return true;
+      return trade.strategy === analysisStrategy;
+    });
+    },
+    [analysisAddressId, analysisStartedAt, analysisStrategy, tradesWithAddress],
+  );
+
+  const analysisWalletName = useMemo(() => {
+    if (!analysisAddressId) return '';
+    const wallet = addresses.find((addr) => addr.id === analysisAddressId);
+    return wallet?.username || wallet?.label || wallet?.address || '';
+  }, [addresses, analysisAddressId]);
+
+  const analysisSlippageCents = useMemo(() => parseSlippageCents(defaultConfig.slippageCents), []);
+
+  useEffect(() => {
+    setVisibleActivityCount(20);
+  }, [analysisAddressId]);
+
+  const buyActivities = useMemo<TradeActivity[]>(() => analysisTrades
+    .filter((trade) => trade.side !== 'SELL')
+    .map((trade) => ({
+    id: `${trade.id}-buy-${new Date(trade.startedAt).getTime()}-${trade.market ?? ''}-${trade.outcome ?? ''}-${trade.amount}`,
+    side: 'BUY',
+    occurredAt: new Date(trade.startedAt),
+    market: trade.market || '-',
+    marketSlug: trade.marketSlug,
+    outcome: trade.outcome || '-',
+    price: trade.entryPrice,
+    share: trade.amount,
+    usd: trade.buyUsd,
+  })), [analysisTrades]);
+
+  const sellActivities = useMemo<TradeActivity[]>(() => analysisTrades
+    .filter((trade) => trade.side === 'SELL' || trade.status === 'closed')
+    .map((trade) => ({
+      id: `${trade.id}-sell-${new Date(trade.side === 'SELL' ? trade.startedAt : (trade.closedAt || trade.startedAt)).getTime()}-${trade.market ?? ''}-${trade.outcome ?? ''}-${trade.amount}`,
+      side: 'SELL',
+      occurredAt: new Date(trade.side === 'SELL' ? trade.startedAt : (trade.closedAt || trade.startedAt)),
+      market: trade.market || '-',
+      marketSlug: trade.marketSlug,
+      outcome: trade.outcome || '-',
+      price: trade.side === 'SELL' ? trade.entryPrice : trade.currentPrice,
+      share: trade.amount,
+      usd: trade.sellUsd,
+    })), [analysisTrades]);
+
+  const myActivities = useMemo(
+    () => [...buyActivities, ...sellActivities].sort((a, b) => b.occurredAt.getTime() - a.occurredAt.getTime()),
+    [buyActivities, sellActivities],
+  );
+
+  useEffect(() => {
+    let active = true;
+
+    const fetchActivityQuote = async (activity: TradeActivity): Promise<ActivityQuoteState | null> => {
+      const market = (activity.marketSlug ?? activity.market ?? '').trim();
+      const outcome = (activity.outcome ?? '').trim();
+      if (!market || !outcome || outcome === '-') return null;
+
+      for (let attempt = 0; attempt < QUOTE_MAX_ATTEMPTS; attempt += 1) {
+        try {
+          const quote = await getMarketQuote(market, outcome);
+          const benchmark = activity.side === 'BUY' ? quote.askCents : quote.bidCents;
+          if (typeof benchmark === 'number' && benchmark > 0) {
+            const benchmarkPrice = benchmark / 100;
+            return {
+              benchmarkPrice,
+              diffPrice: Number((activity.price - benchmarkPrice).toFixed(6)),
+              benchmarkLabel: activity.side === 'BUY' ? 'Ask' : 'Bid',
+            };
+          }
+        } catch {
+          // Ignore transient quote errors and retry limited times.
+        }
+
+        if (attempt < QUOTE_MAX_ATTEMPTS - 1) await delay(QUOTE_RETRY_DELAY_MS);
+      }
+
+      return null;
+    };
+
+    const loadQuotes = async () => {
+      const pendingActivities = myActivities.filter((activity) => !activityQuotes[activity.id]);
+      if (pendingActivities.length === 0) return;
+
+      const loaded = await Promise.all(pendingActivities.map(async (activity) => {
+        const result = await fetchActivityQuote(activity);
+        return [activity.id, result] as const;
+      }));
+
+      if (!active) return;
+
+      const resolvedEntries = loaded.filter(([, result]) => result !== null) as Array<readonly [string, ActivityQuoteState]>;
+      if (resolvedEntries.length === 0) return;
+
+      setActivityQuotes((prev) => ({ ...prev, ...Object.fromEntries(resolvedEntries) }));
+    };
+
+    void loadQuotes();
+    return () => {
+      active = false;
+    };
+  }, [activityQuotes, myActivities]);
+
+  const analysisStats = useMemo(() => {
+    if (analysisTrades.length === 0) return null;
+
+    const startTimestamp = Math.min(...analysisTrades.map((trade) => new Date(trade.startedAt).getTime()));
+    const totalBuy = analysisTrades.reduce((sum, trade) => sum + trade.buyUsd, 0);
+    const totalSell = analysisTrades.reduce((sum, trade) => sum + trade.sellUsd, 0);
+    const inGameMoney = analysisTrades.filter((trade) => trade.status === 'active').reduce((sum, trade) => sum + trade.buyUsd, 0);
+    const slippageThreshold = analysisSlippageCents / 100;
+    const successfulTrades = myActivities.reduce((count, activity) => {
+      const quote = activityQuotes[activity.id];
+      if (!quote) return count;
+      return Math.abs(quote.diffPrice) <= slippageThreshold ? count + 1 : count;
+    }, 0);
+    const successRate = myActivities.length > 0 ? (successfulTrades / myActivities.length) * 100 : 0;
+
+
+    return {
+      startAt: new Date(startTimestamp),
+      totalBudgetText: paperBudget.mode === 'limited' ? `${formatUsd(paperBudget.amount)} (${paperBudget.type === 'daily' ? 'günlük' : 'toplam'})` : 'Sınırsız',
+      freeBudgetText: paperBudget.mode === 'limited' ? formatUsd(paperBudget.remaining) : 'Sınırsız',
+      inGameMoney,
+      totalTransactions: myActivities.length,
+      successfulTrades,
+      successRate,
+      totalBuy,
+      totalSell,
+    };
+  }, [activityQuotes, analysisSlippageCents, analysisTrades, myActivities, paperBudget.amount, paperBudget.mode, paperBudget.remaining, paperBudget.type]);
+
+  const sharePriceData = useMemo(() => {
+    const recentTrades = [...analysisTrades]
+      .sort((a, b) => new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime())
+      .slice(0, MAX_TRADES_FOR_CHART);
+
+    const grouped = new Map<number, { share: number; usdSpent: number }>();
+    for (const trade of recentTrades) {
+      const bucket = Number(trade.entryPrice.toFixed(2));
+      const row = grouped.get(bucket) || { share: 0, usdSpent: 0 };
+      row.share += trade.amount;
+      row.usdSpent += trade.buyUsd;
+      grouped.set(bucket, row);
+    }
+    return Array.from(grouped.entries()).map(([price, values]) => ({ price, ...values })).sort((a, b) => a.price - b.price);
+  }, [analysisTrades]);
+
+  const realOrderStats = useMemo(() => {
+    if (orderStats) return orderStats;
+    const total = orderHistoryRows.length;
+    const applied = orderHistoryRows.filter((row) => row.status === 'matched' || row.status === 'live').length;
+    const unapplied = orderHistoryRows.filter((row) => row.status === 'error' || row.status === 'blocked').length;
+    const pending = Math.max(0, total - applied - unapplied);
+    const denominator = applied + unapplied;
+    const successRate = denominator > 0 ? Number(((applied / denominator) * 100).toFixed(2)) : 0;
+    return {
+      generatedAt: new Date().toISOString(),
+      total,
+      applied,
+      unapplied,
+      pending,
+      successRate,
+    };
+  }, [orderHistoryRows, orderStats]);
+
+  const setConfig = (patch: Partial<WalletModeConfig>) => {
+    if (!setupId || !activeConfigKey) return;
+    setWalletConfigs(prev => ({
+      ...prev,
+      [activeConfigKey]: {
+        ...(prev[activeConfigKey] || { ...defaultConfig, strategy: normalizeStrategyName(setupStrategy) }),
+        ...patch,
+      },
+    }));
+  };
+
+  const handleStrategyInputChange = (nextStrategyValue: string) => {
+    if (!setupId) {
+      setSetupStrategy(nextStrategyValue);
+      return;
+    }
+
+    const previousStrategy = setupStrategy;
+    const previousKey = buildSessionKey(setupId, previousStrategy);
+    const nextKey = buildSessionKey(setupId, nextStrategyValue);
+
+    setSetupStrategy(nextStrategyValue);
+
+    if (previousKey === nextKey) return;
+
+    setWalletConfigs((prev) => {
+      const previousConfig = prev[previousKey] || prev[nextKey];
+      if (!previousConfig) return prev;
+
+      const nextConfig: WalletModeConfig = {
+        ...previousConfig,
+        strategy: normalizeStrategyName(nextStrategyValue),
+      };
+
+      const rest = { ...prev };
+      delete rest[previousKey];
+      return {
+        ...rest,
+        [nextKey]: nextConfig,
+      };
+    });
+  };
+
+  const isWalletSelected = Boolean(setupId);
+
+  const resolveBudgetDraft = (): BudgetDraft => ({
+    mode: budgetMode,
+    type: budgetType,
+    amount: Math.max(0, parseFloat(budgetAmount) || 0),
+  });
+
+  const applyBudget = () => {
+    const nextBudget = resolveBudgetDraft();
+    setPaperBudget(nextBudget);
+    toast.success('Bütçe ayarları güncellendi');
+  };
+
+  const calculateTradeUsd = (config: WalletModeConfig, budgetDraft?: BudgetDraft) => {
+    const sourceTradeUsd = parseFloat(config.sourceTradeUsd) || 0;
+    const leaderFree = parseFloat(config.leaderFreeBalance) || 0;
+    const multiplier = parseFloat(config.multiplier) || 1;
+    const fixedAmount = parseFloat(config.fixedAmount) || 0;
+    const fixedShares = parseFloat(config.fixedShares) || 0;
+    const sharePrice = parseFloat(config.sharePrice) || 1;
+
+    const activeBudget = budgetDraft ?? paperBudget;
+    const proportionalBudgetBase = activeBudget.mode === 'limited'
+      ? Math.max(activeBudget.amount, 0)
+      : Math.max(myDynamicFreeBalance, 0);
+
+    switch (config.mode) {
+      case 'notional': return sourceTradeUsd;
+      case 'proportional': {
+        if (sourceTradeUsd <= 0 || leaderFree <= 0 || proportionalBudgetBase <= 0) return 0;
+        const sourceTradeRatio = sourceTradeUsd / leaderFree;
+        return sourceTradeRatio * proportionalBudgetBase;
+      }
+      case 'multiplier': return sourceTradeUsd * multiplier;
+      case 'fixed-amount': return fixedAmount;
+      case 'buy-wait': return fixedAmount;
+      case 'fixed-shares': return fixedShares * sharePrice;
+      default: return sourceTradeUsd;
+    }
+  };
+
+
+
+  const syncWalletCopyTrades = useCallback(async (sessionKey: string) => {
+    if (syncingWalletsRef.current.has(sessionKey)) return;
+    syncingWalletsRef.current.add(sessionKey);
+
+    const session = copySessionsRef.current[sessionKey];
+    if (!session) {
+      syncingWalletsRef.current.delete(sessionKey);
+      return;
+    }
+
+    const targetAddress = addresses.find((address) => address.id === session.addressId);
+    if (!targetAddress) {
+      syncingWalletsRef.current.delete(sessionKey);
+      return;
+    }
+
+    setCopySessions((prev) => {
+      const current = prev[sessionKey];
+      if (!current || current.status === 'idle') return prev;
+      return { ...prev, [sessionKey]: { ...current, status: 'syncing' } };
+    });
+
+    try {
+      const payload = await getWalletEventsWithStats(targetAddress.address, { limit: TRACKER_EVENTS_LIMIT });
+      const events = sortEventsOldestFirst(payload.events);
+      const latestEvent = events.at(-1);
+
+      setWalletConfigs((prev) => {
+        const baseConfig = prev[sessionKey] || { ...defaultConfig, strategy: session.strategy };
+        return {
+          ...prev,
+          [sessionKey]: {
+            ...baseConfig,
+            sourceTradeUsd: String(latestEvent?.value_usd ?? baseConfig.sourceTradeUsd),
+            sharePrice: String(latestEvent?.price ?? baseConfig.sharePrice),
+            fixedShares: String(latestEvent?.size ?? baseConfig.fixedShares),
+            direction: resolveDirection(latestEvent) ?? baseConfig.direction,
+            leaderFreeBalance: String(resolveLeaderFreeBalance(targetAddress.polygonscanTopTotalValText) ?? baseConfig.leaderFreeBalance),
+          },
+        };
+      });
+
+      const liveSession = copySessionsRef.current[sessionKey];
+      if (!liveSession || liveSession.status === 'idle') return;
+      if (!events.length) {
+        setCopySessions((prev) => ({ ...prev, [sessionKey]: { ...prev[sessionKey], status: 'running' } }));
+        return;
+      }
+
+      const latestEventKey = getEventKey(events[events.length - 1]);
+      if (!liveSession.lastEventKey) {
+        setCopySessions((prev) => ({ ...prev, [sessionKey]: { ...prev[sessionKey], status: 'running', lastEventKey: latestEventKey } }));
+        return;
+      }
+
+      const seenIndex = events.findIndex((event) => getEventKey(event) === liveSession.lastEventKey);
+      const freshEvents = seenIndex === -1 ? events : events.slice(seenIndex + 1);
+
+      if (freshEvents.length === 0) {
+        setCopySessions((prev) => ({ ...prev, [sessionKey]: { ...prev[sessionKey], status: 'running', lastEventKey: latestEventKey } }));
+        return;
+      }
+
+      const cfg = walletConfigsRef.current[sessionKey] || { ...defaultConfig, strategy: liveSession.strategy };
+      let openedTrades = 0;
+      const nextMarketBuyCounts: Record<string, number> = { ...(liveSession.marketBuyCounts || {}) };
+
+      for (const event of freshEvents) {
+        if (!isTradeEvent(event)) continue;
+
+        const eventSide = resolveEventSide(event);
+        if (!eventSide) continue;
+        if (cfg.mode === 'buy-wait' && eventSide !== 'BUY') continue;
+
+        const eventPrice = toPositiveNumber(event.price);
+        const eventSize = toPositiveNumber(event.size);
+        if (eventPrice <= 0 || eventSize <= 0) continue;
+
+        if (!isEventInConfiguredRanges(eventPrice, eventSize, cfg)) continue;
+
+        const sourceTradeUsd = resolveEventTradeUsd(event, toPositiveNumber(cfg.sourceTradeUsd));
+        const eventConfig: WalletModeConfig = {
+          ...cfg,
+          sourceTradeUsd: String(sourceTradeUsd || cfg.sourceTradeUsd),
+          sharePrice: String(eventPrice),
+          fixedShares: String(eventSize),
+          direction: resolveDirection(event) ?? cfg.direction,
+          strategy: normalizeStrategyName(cfg.strategy),
+        };
+        const tradeUsd = calculateTradeUsd(eventConfig);
+        if (tradeUsd <= 0) continue;
+
+        if (eventConfig.mode === 'buy-wait') {
+          const buyLimit = Math.floor(parseFloat(eventConfig.buyWaitLimit) || 0);
+          if (buyLimit <= 0) continue;
+          const marketKey = resolveMarketKey(event);
+          if (!marketKey) continue;
+          const copiedCount = nextMarketBuyCounts[marketKey] || 0;
+          if (copiedCount >= buyLimit) continue;
+        }
+
+        const result = startPaperTrade(session.addressId, {
+          strategy: eventConfig.strategy,
+          direction: eventSide === 'BUY' ? 'long' : 'short',
+          spendUsd: tradeUsd,
+          copyMode: eventConfig.mode,
+          entryPrice: eventPrice,
+          shareAmount: eventConfig.mode === 'notional' ? eventSize : undefined,
+          side: eventSide,
+          marketSlug: event.market_slug ?? undefined,
+          market: event.market ?? undefined,
+          outcome: event.outcome ?? undefined,
+        });
+
+        if (result.ok) {
+          openedTrades += 1;
+
+          if (eventConfig.mode === 'buy-wait') {
+            const marketKey = resolveMarketKey(event);
+            if (marketKey) nextMarketBuyCounts[marketKey] = (nextMarketBuyCounts[marketKey] || 0) + 1;
+          }
+        }
+      }
+
+      setCopySessions((prev) => ({
+        ...prev,
+        [sessionKey]: {
+          ...prev[sessionKey],
+          status: 'running',
+          lastEventKey: latestEventKey,
+          marketBuyCounts: nextMarketBuyCounts,
+        },
+      }));
+
+      setCopySessionErrors((prev) => ({ ...prev, [sessionKey]: null }));
+      if (openedTrades > 0) toast.success(`${openedTrades} yeni aktivite kopyalandı`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Copy trade senkronizasyonu sırasında hata oluştu';
+      setCopySessionErrors((prev) => ({ ...prev, [sessionKey]: message }));
+      toast.error(message);
+      setCopySessions((prev) => {
+        const current = prev[sessionKey];
+        if (!current || current.status === 'idle') return prev;
+        return { ...prev, [sessionKey]: { ...current, status: 'running' } };
+      });
+    } finally {
+      syncingWalletsRef.current.delete(sessionKey);
+    }
+  }, [addresses, calculateTradeUsd, startPaperTrade]);
+
+  useEffect(() => {
+    if (isRealMode) return;
+    const runningWalletIds = Object.entries(copySessions)
+      .filter(([, session]) => session.status !== 'idle')
+      .map(([walletId]) => walletId);
+
+    if (!runningWalletIds.length) return;
+
+    let active = true;
+    let timeoutId: number | undefined;
+
+    const tick = async () => {
+      const startedAt = Date.now();
+      const currentlyRunningIds = Object.entries(copySessionsRef.current)
+        .filter(([, session]) => session.status !== 'idle')
+        .map(([walletId]) => walletId);
+
+      await Promise.all(currentlyRunningIds.map(async (walletId) => {
+        await syncWalletCopyTrades(walletId);
+      }));
+
+      if (!active) return;
+      const elapsedMs = Date.now() - startedAt;
+      const nextDelayMs = Math.max(0, TRACKER_POLL_MS - elapsedMs);
+      timeoutId = window.setTimeout(() => {
+        void tick();
+      }, nextDelayMs);
+    };
+
+    void tick();
+
+    return () => {
+      active = false;
+      if (timeoutId !== undefined) window.clearTimeout(timeoutId);
+    };
+  }, [copySessions, isRealMode, syncWalletCopyTrades]);
+
+  const handleStart = async () => {
+    if (!setupId) return toast.error('Önce bir cüzdan seçin');
+
+    const nextBudget = resolveBudgetDraft();
+    if (currentConfig.mode === 'proportional' && nextBudget.mode !== 'limited') {
+      return toast.error('Proportional modunda bütçe tipi Limitli olmalı');
+    }
+
+    setPaperBudget(nextBudget);
+
+    const strategyName = normalizeStrategyName(setupStrategy);
+    const sessionKey = buildSessionKey(setupId, strategyName);
+
+    const existingSession = copySessionsRef.current[sessionKey];
+    if (existingSession?.status === "running" || existingSession?.status === "syncing") {
+      return toast.error('Bu cüzdan için aynı Trade Stratejisi zaten aktif. Farklı bir Trade Stratejisi adı girin.');
+    }
+
+    const rangeError = validateRangeConfig(currentConfig);
+    if (rangeError) return toast.error(rangeError);
+
+    const latestConfig = await loadAutoConfig(setupId, strategyName) || currentConfig;
+    const latestConfigRangeError = validateRangeConfig(latestConfig);
+    if (latestConfigRangeError) return toast.error(latestConfigRangeError);
+
+    const selectedAddress = addresses.find((address) => address.id === setupId);
+    if (!selectedAddress) return toast.error('Cüzdan bulunamadı');
+
+    if (isRealMode) {
+      const toNullableNumber = (value: string | undefined): number | null => {
+        const parsed = parseOptionalNumber(value);
+        return parsed === null || Number.isNaN(parsed) ? null : parsed;
+      };
+
+      try {
+        await startCopySession({
+          addressId: setupId,
+          walletAddress: selectedAddress.address,
+          strategy: strategyName,
+          config: {
+            mode: latestConfig.mode,
+            sourceTradeUsd: toPositiveNumber(latestConfig.sourceTradeUsd),
+            leaderFreeBalance: toPositiveNumber(latestConfig.leaderFreeBalance),
+            multiplier: toPositiveNumber(latestConfig.multiplier) || 1,
+            fixedAmount: toPositiveNumber(latestConfig.fixedAmount),
+            buyWaitLimit: Math.floor(toPositiveNumber(latestConfig.buyWaitLimit)),
+            fixedShares: toPositiveNumber(latestConfig.fixedShares),
+            sharePrice: toPositiveNumber(latestConfig.sharePrice),
+            slippageCents: latestConfig.useSlippage ? parseSlippageCents(latestConfig.slippageCents) : 0,
+            useSlippage: latestConfig.useSlippage !== false,
+            centRangeMin: toNullableNumber(latestConfig.centRangeMin),
+            centRangeMax: toNullableNumber(latestConfig.centRangeMax),
+            shareRangeMin: toNullableNumber(latestConfig.shareRangeMin),
+            shareRangeMax: toNullableNumber(latestConfig.shareRangeMax),
+            budgetBaseUsd: nextBudget.mode === 'limited'
+              ? Math.max(nextBudget.amount, 0)
+              : Math.max(parseFloat(virtualFreeBalance) || 0, 0),
+          },
+        });
+
+        setCopySessions((prev) => ({
+          ...prev,
+          [sessionKey]: {
+            addressId: setupId,
+            strategy: strategyName,
+            startedAt: new Date(),
+            status: 'running',
+            marketBuyCounts: {},
+          },
+        }));
+        setCopySessionErrors((prev) => ({ ...prev, [sessionKey]: null }));
+        toast.success('Real copy trade takibi başlatıldı.');
+        setCollapsed(true);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Takip başlatılırken backend session oluşturulamadı';
+        setCopySessionErrors((prev) => ({ ...prev, [sessionKey]: message }));
+        toast.error(message);
+      }
+      return;
+    }
+
+    try {
+      const payload = await getWalletEventsWithStats(selectedAddress.address, { limit: TRACKER_EVENTS_LIMIT });
+      const latestEvent = getLatestEvent(payload.events);
+      const latestEventKey = latestEvent ? getEventKey(latestEvent) : undefined;
+
+      setCopySessions((prev) => ({
+        ...prev,
+        [sessionKey]: {
+          addressId: setupId,
+          strategy: strategyName,
+          startedAt: new Date(),
+          status: 'running',
+          lastEventKey: latestEventKey,
+          marketBuyCounts: {},
+        },
+      }));
+      setCopySessionErrors((prev) => ({ ...prev, [sessionKey]: null }));
+
+      toast.success('Copy trade takip sistemi başlatıldı. Yeni aktiviteler otomatik kopyalanacak.');
+      setCollapsed(true);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Takip başlatılırken event verisi alınamadı';
+      setCopySessionErrors((prev) => ({ ...prev, [sessionKey]: message }));
+      toast.error(message);
+    }
+  };
+
+  const handleStop = async (sessionKey: string) => {
+    const currentSession = copySessionsRef.current[sessionKey];
+    if (!currentSession) return;
+
+    if (isRealMode) {
+      try {
+        await stopCopySession({
+          addressId: currentSession.addressId,
+          strategy: currentSession.strategy,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Backend session durdurulamadı';
+        setCopySessionErrors((prev) => ({ ...prev, [sessionKey]: message }));
+        toast.error(message);
+        return;
+      }
+    }
+
+    if (currentSession.status === 'running' || currentSession.status === 'syncing') {
+      const wallet = addresses.find((address) => address.id === currentSession.addressId);
+      setTrackingHistory((prev) => [{
+        id: `${sessionKey}-${Date.now()}`,
+        addressId: currentSession.addressId,
+        startedAt: currentSession.startedAt,
+        walletName: wallet?.username || wallet?.label || wallet?.address || currentSession.addressId,
+        walletAddress: wallet?.address,
+        strategy: currentSession.strategy,
+        stoppedAt: new Date(),
+      }, ...prev]);
+    }
+
+    setCopySessions((prev) => ({
+      ...prev,
+      [sessionKey]: {
+        ...prev[sessionKey],
+        status: 'idle',
+      },
+    }));
+    setCopySessionErrors((prev) => ({ ...prev, [sessionKey]: null }));
+    toast.success('Copy trade takibi durduruldu');
+  };
+
+  const handleRestartFromHistory = async (historyItem: TrackingHistoryItem) => {
+    const sessionKey = buildSessionKey(historyItem.addressId, historyItem.strategy);
+    const existingSession = copySessionsRef.current[sessionKey];
+    if (existingSession?.status === 'running' || existingSession?.status === 'syncing') {
+      return toast.error('Bu cüzdan için aynı Trade Stratejisi zaten aktif.');
+    }
+
+    const walletAddress = addresses.find((address) => address.id === historyItem.addressId)?.address || historyItem.walletAddress;
+    if (!walletAddress) return toast.error('Cüzdan adresi bulunamadı');
+
+    try {
+      const payload = await getWalletEventsWithStats(walletAddress, { limit: TRACKER_EVENTS_LIMIT });
+      const latestEvent = getLatestEvent(payload.events);
+      const latestEventKey = latestEvent ? getEventKey(latestEvent) : undefined;
+
+      setCopySessions((prev) => ({
+        ...prev,
+        [sessionKey]: {
+          addressId: historyItem.addressId,
+          strategy: historyItem.strategy,
+          startedAt: new Date(),
+          status: 'running',
+          lastEventKey: latestEventKey,
+          marketBuyCounts: {},
+        },
+      }));
+      setCopySessionErrors((prev) => ({ ...prev, [sessionKey]: null }));
+      setTrackingHistory((prev) => prev.filter((item) => item.id !== historyItem.id));
+      toast.success('Takip yeniden başlatıldı');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Takip yeniden başlatılırken event verisi alınamadı';
+      setCopySessionErrors((prev) => ({ ...prev, [sessionKey]: message }));
+      toast.error(message);
+    }
+  };
+
+  const handleClearOrderHistory = async () => {
+    if (!isRealMode) return;
+    setIsClearingOrderHistory(true);
+    try {
+      const result = await clearOrderHistory();
+      setOrderHistoryRows([]);
+      setOrderStats({
+        generatedAt: result.clearedAt,
+        total: 0,
+        applied: 0,
+        unapplied: 0,
+        pending: 0,
+        successRate: 0,
+      });
+      toast.success(`Geçmiş temizlendi (${result.removed} kayıt silindi).`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Order geçmişi temizlenemedi';
+      toast.error(message);
+    } finally {
+      setIsClearingOrderHistory(false);
+    }
+  };
+
+  const selectedSession = activeConfigKey ? copySessions[activeConfigKey] : undefined;
+  const isSelectedRunning = selectedSession?.status === 'running' || selectedSession?.status === 'syncing';
+
+  return (
+    <div className="animate-slide-up">
+      <div className="flex items-center justify-between mb-6">
+        <div>
+          <h2 className="text-xl font-bold text-foreground">{isRealMode ? 'Gerçek Trade' : 'Paper Trading'}</h2>
+          <p className="text-xs text-muted-foreground">
+            {isRealMode
+              ? 'Bütçe + cüzdan bazlı manuel copy trade (takibi başlatınca gerçek order gönderir)'
+              : 'Bütçe + cüzdan bazlı copy trade test ortamı'}
+          </p>
+        </div>
+      </div>
+
+      {view === 'paper' && (
+        <>
+          <div className="glass-card p-5 mb-6">
+            <h3 className="text-sm font-semibold text-foreground mb-4">Takip Edilen Cüzdanlar</h3>
+            <label className="text-xs font-medium text-muted-foreground mb-2 block">Copy trade için cüzdan seç</label>
+            <div className="flex items-center gap-3">
+              <Wallet className="w-4 h-4 text-primary" />
+              <select
+                value={setupId || ''}
+                onChange={(e) => { setSetupId(e.target.value || null); setSetupStrategy(defaultConfig.strategy); setCollapsed(false); }}
+                className="w-full px-3 py-2 rounded-lg bg-secondary/50 border border-border/30 text-sm"
+              >
+                <option value="">Cüzdan seçin...</option>
+                {addresses.map((addr) => (
+                  <option key={addr.id} value={addr.id}>{(addr.username || addr.label || addr.address)} • {addr.category}</option>
+                ))}
+              </select>
+            </div>
+            {Object.entries(copySessions).some(([, session]) => session.status !== 'idle') && (
+              <div className="mt-3 rounded-lg border border-primary/30 bg-primary/5 p-2 text-xs text-primary">
+                Takip aktif: {Object.entries(copySessions)
+                  .filter(([, session]) => session.status !== 'idle')
+                  .map(([, session]) => {
+                    const wallet = addresses.find((addr) => addr.id === session.addressId);
+                    const walletName = wallet?.username || wallet?.label || session.addressId;
+                    return `${walletName} • ${session.strategy}`;
+                  })
+                  .join(', ')}
+              </div>
+            )}
+          </div>
+
+          <div className="glass-card p-5 mb-6">
+            <h3 className="text-sm font-semibold text-foreground mb-4">Bütçe Yönetimi</h3>
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <div>
+                <label className="text-xs font-medium text-muted-foreground mb-2 block">Bütçe Tipi</label>
+                <div className="flex gap-2 mb-2">
+                  <button
+                    onClick={() => setBudgetMode('unlimited')}
+                    disabled={currentConfig.mode === 'proportional'}
+                    className={`px-3 py-2 rounded-lg text-xs border ${budgetMode === 'unlimited' ? 'bg-primary/15 text-primary border-primary/30' : 'bg-secondary/40 border-border/30 text-muted-foreground'} disabled:opacity-40 disabled:cursor-not-allowed`}
+                  >
+                    Sınırsız
+                  </button>
+                  <button onClick={() => setBudgetMode('limited')} className={`px-3 py-2 rounded-lg text-xs border ${budgetMode === 'limited' ? 'bg-primary/15 text-primary border-primary/30' : 'bg-secondary/40 border-border/30 text-muted-foreground'}`}>Limitli</button>
+                </div>
+                {currentConfig.mode === 'proportional' && (
+                  <p className="text-[11px] text-muted-foreground mb-2">
+                    Proportional modunda bütçe tipi otomatik olarak <span className="font-semibold text-foreground">Limitli</span> tutulur.
+                  </p>
+                )}
+                {budgetMode === 'limited' && (
+                  <div className="grid grid-cols-2 gap-2 mb-2">
+                    <select value={budgetType} onChange={(e) => setBudgetType(e.target.value as 'daily' | 'total')} className="px-3 py-2 rounded-lg bg-secondary/50 border border-border/30 text-sm">
+                      <option value="daily">Günlük</option>
+                      <option value="total">Toplam</option>
+                    </select>
+                    <input type="number" value={budgetAmount} onChange={(e) => setBudgetAmount(e.target.value)} className="px-3 py-2 rounded-lg bg-secondary/50 border border-border/30 text-sm" placeholder="USD" />
+                  </div>
+                )}
+                <button onClick={applyBudget} className="px-3 py-2 rounded-lg text-xs bg-primary/10 text-primary border border-primary/30">Bütçeyi Kaydet</button>
+
+                <div className="mt-4 space-y-3">
+                  {!isWalletSelected && (
+                    <div className="rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-[11px] text-warning">
+                      Aralık değerlerini düzenlemek için önce bir cüzdan seçin.
+                    </div>
+                  )}
+                  <div>
+                    <label className="text-xs font-medium text-muted-foreground mb-2 block">Alınacak Cent Aralığı</label>
+                    <div className="grid grid-cols-2 gap-2">
+                      <input
+                        type="number"
+                        min="1"
+                        max="99"
+                        value={currentConfig.centRangeMin}
+                        onChange={(e) => setConfig({ centRangeMin: e.target.value })}
+                        onBlur={(e) => setConfig({ centRangeMin: normalizeCentInputOnBlur(e.target.value) })}
+                        disabled={!isWalletSelected}
+                        className="px-3 py-2 rounded-lg bg-secondary/50 border border-border/30 text-sm"
+                        placeholder="Min (boşsa 1)"
+                      />
+                      <input
+                        type="number"
+                        min="1"
+                        max="99"
+                        value={currentConfig.centRangeMax}
+                        onChange={(e) => setConfig({ centRangeMax: e.target.value })}
+                        onBlur={(e) => setConfig({ centRangeMax: normalizeCentInputOnBlur(e.target.value) })}
+                        disabled={!isWalletSelected}
+                        className="px-3 py-2 rounded-lg bg-secondary/50 border border-border/30 text-sm"
+                        placeholder="Maks (boşsa 99)"
+                      />
+                    </div>
+                    <p className="mt-1 text-[11px] text-muted-foreground">Bu aralık yalnızca aktivitedeki Price değerine uygulanır (dahilidir). Min boşsa 1, max boşsa 99 kabul edilir.</p>
+                  </div>
+
+                  <div>
+                    <label className="text-xs font-medium text-muted-foreground mb-2 block">Alınacak Share Aralığı</label>
+                    <div className="grid grid-cols-2 gap-2">
+                      <input
+                        type="number"
+                        min="0"
+                        step="0.0001"
+                        value={currentConfig.shareRangeMin}
+                        onChange={(e) => setConfig({ shareRangeMin: e.target.value })}
+                        onBlur={(e) => setConfig({ shareRangeMin: normalizeShareInputOnBlur(e.target.value) })}
+                        disabled={!isWalletSelected}
+                        className="px-3 py-2 rounded-lg bg-secondary/50 border border-border/30 text-sm"
+                        placeholder="Min Share (boşsa 0)"
+                      />
+                      <input
+                        type="number"
+                        min="0"
+                        step="0.0001"
+                        value={currentConfig.shareRangeMax}
+                        onChange={(e) => setConfig({ shareRangeMax: e.target.value })}
+                        onBlur={(e) => setConfig({ shareRangeMax: normalizeShareInputOnBlur(e.target.value) })}
+                        disabled={!isWalletSelected}
+                        className="px-3 py-2 rounded-lg bg-secondary/50 border border-border/30 text-sm"
+                        placeholder="Maks Share (boşsa sınırsız)"
+                      />
+                    </div>
+                    <p className="mt-1 text-[11px] text-muted-foreground">Share min boşsa 0 kabul edilir. Share max boş bırakılırsa üst sınır uygulanmaz.</p>
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      <button
+                        type="button"
+                        disabled={!isWalletSelected}
+                        onClick={() => setConfig({ centRangeMin: '40', centRangeMax: '60' })}
+                        className="px-2 py-1 rounded border border-border/40 text-[11px] text-muted-foreground disabled:opacity-40"
+                      >
+                        Hazır Cent: 40-60
+                      </button>
+                      <button
+                        type="button"
+                        disabled={!isWalletSelected}
+                        onClick={() => setConfig({ centRangeMin: '', centRangeMax: '', shareRangeMin: '', shareRangeMax: '' })}
+                        className="px-2 py-1 rounded border border-border/40 text-[11px] text-muted-foreground disabled:opacity-40"
+                      >
+                        Aralıkları Temizle
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <label className="text-xs font-medium text-muted-foreground">Copy Trade Setup</label>
+                  <button onClick={() => setCollapsed(!collapsed)} className="text-xs text-muted-foreground inline-flex items-center gap-1">{collapsed ? <ChevronDown className="w-3 h-3" /> : <ChevronUp className="w-3 h-3" />} {collapsed ? 'Aç' : 'Daralt'}</button>
+                </div>
+                {!collapsed && (
+                  <div className="space-y-2">
+                    <select
+                      value={currentConfig.mode}
+                      onChange={(e) => {
+                        const nextMode = e.target.value as CopyMode;
+                        setSetupStrategy(getCopyModeLabel(nextMode));
+                        setConfig({ mode: nextMode });
+                        if (nextMode === 'proportional') {
+                          setBudgetMode('limited');
+                          setBudgetAmount('100');
+                          setPaperBudget({ mode: 'limited', type: budgetType, amount: 100 });
+                        }
+                      }}
+                      className="w-full px-3 py-2 rounded-lg bg-secondary/50 border border-border/30 text-sm"
+                    >
+                      {COPY_MODE_OPTIONS.map((opt) => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
+                    </select>
+                    <p className="text-[11px] text-muted-foreground">{COPY_MODE_OPTIONS.find((item) => item.value === currentConfig.mode)?.description}</p>
+                    <div className="rounded-lg bg-secondary/20 border border-border/20 p-2 text-[11px] text-muted-foreground">
+                      Source USD ve Leader bakiye değerleri otomatik olarak takip edilen cüzdandan çekilir.
+                    </div>
+                    {currentConfig.mode === 'multiplier' && (
+                      <label className="block">
+                        <span className="mb-1 block text-[11px] text-muted-foreground">Multiplier değeri (k)</span>
+                        <input type="number" step="0.1" value={currentConfig.multiplier} onChange={(e) => setConfig({ multiplier: e.target.value })} className="w-full px-3 py-2 rounded-lg bg-secondary/50 border border-border/30 text-sm" placeholder="Örn: 1.5" />
+                      </label>
+                    )}
+                    {currentConfig.mode === 'fixed-amount' && (
+                      <label className="block">
+                        <span className="mb-1 block text-[11px] text-muted-foreground">Her işlem için sabit alım tutarı (USD)</span>
+                        <input type="number" min="0" value={currentConfig.fixedAmount} onChange={(e) => setConfig({ fixedAmount: e.target.value })} className="w-full px-3 py-2 rounded-lg bg-secondary/50 border border-border/30 text-sm" placeholder="Örn: 50" />
+                      </label>
+                    )}
+                    {currentConfig.mode === 'buy-wait' && (
+                      <>
+                        <label className="block">
+                          <span className="mb-1 block text-[11px] text-muted-foreground">Market başına kopyalanacak maksimum alım adedi</span>
+                          <input type="number" min="1" value={currentConfig.buyWaitLimit} onChange={(e) => setConfig({ buyWaitLimit: e.target.value })} className="w-full px-3 py-2 rounded-lg bg-secondary/50 border border-border/30 text-sm" placeholder="Örn: 2" />
+                        </label>
+                        <label className="block">
+                          <span className="mb-1 block text-[11px] text-muted-foreground">Her alımda kullanılacak sabit tutar (USD)</span>
+                          <input type="number" min="0" value={currentConfig.fixedAmount} onChange={(e) => setConfig({ fixedAmount: e.target.value })} className="w-full px-3 py-2 rounded-lg bg-secondary/50 border border-border/30 text-sm" placeholder="Örn: 50" />
+                        </label>
+                      </>
+                    )}
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                      <label className="block">
+                        <span className="mb-1 block text-[11px] text-muted-foreground">Trade Stratejisi</span>
+                        <input
+                          type="text"
+                          value={setupStrategy}
+                          onChange={(e) => handleStrategyInputChange(e.target.value)}
+                          className="w-full px-3 py-2 rounded-lg bg-secondary/50 border border-border/30 text-sm"
+                          placeholder="Strateji"
+                        />
+                      </label>
+                      <label className="block">
+                        <span className="mb-1 block text-[11px] text-muted-foreground">Slippage Ayarı</span>
+                        <label className="mb-2 inline-flex items-center gap-2 text-[11px] text-muted-foreground">
+                          <input
+                            type="checkbox"
+                            checked={currentConfig.useSlippage}
+                            onChange={(e) => setConfig({ useSlippage: e.target.checked })}
+                            className="h-3.5 w-3.5 rounded border-border/40 bg-secondary/40"
+                          />
+                          Slippage uygula
+                        </label>
+                        <input
+                          type="number"
+                          min="0"
+                          step="0.01"
+                          value={currentConfig.slippageCents}
+                          onChange={(e) => setConfig({ slippageCents: e.target.value })}
+                          disabled={!currentConfig.useSlippage}
+                          className="w-full px-3 py-2 rounded-lg bg-secondary/50 border border-border/30 text-sm disabled:opacity-50"
+                          placeholder="Örn: 5"
+                        />
+                        {!currentConfig.useSlippage && (
+                          <p className="mt-1 text-[10px] text-muted-foreground">
+                            Kapalıyken market/quote resolve beklenmez, asset_id ile anında order denenir.
+                          </p>
+                        )}
+                      </label>
+                    </div>
+                    <p className="text-xs text-muted-foreground">Hesaplanan trade tutarı: <span className="font-mono text-foreground">${calculateTradeUsd(currentConfig, resolveBudgetDraft()).toFixed(2)}</span></p>
+                  </div>
+                )}
+                {!isSelectedRunning ? (
+                  <button onClick={handleStart} className="mt-3 w-full py-3 rounded-lg font-semibold text-sm bg-primary/10 text-primary border border-primary/30 hover:bg-primary/20">
+                    <Play className="w-4 h-4 inline mr-2" /> {(addresses.find(a => a.id === setupId)?.username || addresses.find(a => a.id === setupId)?.label || 'Seçili cüzdan')} için Takibi Başlat
+                  </button>
+                ) : (
+                  <button onClick={() => { if (activeConfigKey) void handleStop(activeConfigKey); }} className="mt-3 w-full py-3 rounded-lg font-semibold text-sm bg-warning/10 text-warning border border-warning/30 hover:bg-warning/20">
+                    {(addresses.find(a => a.id === setupId)?.username || addresses.find(a => a.id === setupId)?.label || 'Seçili cüzdan')} için Takibi Durdur
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {runningSessions.length > 0 && (
+            <div className="mb-6">
+              <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-3">AKTİF TAKİPLER ({runningSessions.length})</h3>
+              <div className="space-y-2">
+                {runningSessions.map(({ sessionKey, addressId, session, strategy, startedAt, walletName, walletAddress }) => {
+                  const activeTradeCount = getSessionActiveTradeCount(addressId, strategy, startedAt);
+                  const statusLabel = session.status === 'syncing' ? 'SENKRONİZE EDİLİYOR' : 'TAKİP AKTİF';
+                  const sessionConfig = walletConfigs[sessionKey] || { ...defaultConfig, strategy };
+                  const configDescription = describeSessionConfig(sessionConfig);
+                  return (
+                    <div key={sessionKey} className="glass-card p-4 border border-primary/20">
+                      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                        <div>
+                          <p className="text-xs font-semibold text-foreground">{walletName} <span className="text-muted-foreground">• {strategy}</span></p>
+                          <p className="font-mono text-[10px] text-muted-foreground truncate">{walletAddress || addressId}</p>
+                          <p className="mt-1 text-[11px] text-muted-foreground">{configDescription}</p>
+                          {copySessionErrors[sessionKey] && (
+                            <p className="mt-2 text-[11px] text-destructive">Hata: {copySessionErrors[sessionKey]}</p>
+                          )}
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <span className="px-2 py-1 rounded text-[10px] font-semibold bg-primary/15 text-primary">{statusLabel}</span>
+                          <span className="px-2 py-1 rounded text-[10px] font-semibold bg-secondary/60 text-foreground">Aktif Trade: {activeTradeCount}</span>
+                          <button
+                            type="button"
+                            onClick={() => { void handleStop(sessionKey); }}
+                            className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg text-[11px] font-medium border border-warning/40 bg-warning/10 text-warning hover:bg-warning/20"
+                          >
+                            <Pause className="w-3.5 h-3.5" /> Durdur
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          <div className="mb-6">
+            <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-3">Pasif Tradeler ({passiveSessions.length})</h3>
+            {passiveSessions.length === 0 ? (
+              <div className="glass-card p-6 text-center text-muted-foreground text-sm">Takip edilmeyen cüzdan yok</div>
+            ) : (
+              <div className="space-y-2">
+                {passiveSessions.map(({ addressId, strategy, walletName, walletAddress }) => {
+                  const activeTradeCount = activeTrades.filter((trade) => trade.addressId === addressId).length;
+                  return (
+                    <div key={addressId} className="glass-card p-4 border border-border/30">
+                      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                        <div>
+                          <p className="text-xs font-semibold text-foreground">{walletName} <span className="text-muted-foreground">• {strategy}</span></p>
+                          <p className="font-mono text-[10px] text-muted-foreground truncate">{walletAddress || addressId}</p>
+                          <p className="mt-1 text-[11px] text-muted-foreground">Bu cüzdan şu an takip edilmiyor. Takibi başlatmadan yeni trade otomatik oluşmaz.</p>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <span className="px-2 py-1 rounded text-[10px] font-semibold bg-secondary/60 text-foreground">TAKİP PASİF</span>
+                          <span className="px-2 py-1 rounded text-[10px] font-semibold bg-secondary/60 text-foreground">Aktif Trade: {activeTradeCount}</span>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          <div className="mb-6">
+            <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-3">Geçmiş Takipler ({trackingHistory.length})</h3>
+            {trackingHistory.length === 0 ? (
+              <div className="glass-card p-6 text-center text-muted-foreground text-sm">Durdurulan takip bulunmuyor</div>
+            ) : (
+              <div className="space-y-2">
+                {trackingHistory.map((historyItem) => (
+                  <div key={historyItem.id} className="glass-card p-4 border border-border/30">
+                    <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                      <div>
+                        <p className="text-xs font-semibold text-foreground">{historyItem.walletName} <span className="text-muted-foreground">• {historyItem.strategy}</span></p>
+                        <p className="font-mono text-[10px] text-muted-foreground truncate">{historyItem.walletAddress || historyItem.addressId}</p>
+                        <p className="mt-1 text-[11px] text-muted-foreground">Durdurma zamanı: {formatDate(historyItem.stoppedAt)}</p>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => handleRestartFromHistory(historyItem)}
+                          className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg text-[11px] font-medium border border-emerald-500/40 bg-emerald-500/10 text-emerald-600 hover:bg-emerald-500/20"
+                        >
+                          <RotateCcw className="w-3.5 h-3.5" /> Tekrar Başlat
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {isRealMode && (
+            <div className="mb-6 glass-card p-5">
+              <div className="mb-3 flex items-center justify-between gap-3">
+                <h3 className="text-sm font-semibold text-foreground">Kopya Trade Geçmişi (Son 200)</h3>
+                <button
+                  type="button"
+                  onClick={() => { void handleClearOrderHistory(); }}
+                  disabled={isClearingOrderHistory}
+                  className="inline-flex items-center rounded-md border border-destructive/40 bg-destructive/10 px-2.5 py-1.5 text-[11px] font-medium text-destructive hover:bg-destructive/20 disabled:opacity-60"
+                >
+                  {isClearingOrderHistory ? 'Temizleniyor...' : 'Geçmişi Temizle'}
+                </button>
+              </div>
+              <div className="grid grid-cols-2 lg:grid-cols-5 gap-2 mb-4">
+                {[
+                  { label: 'TOPLAM', value: String(realOrderStats.total) },
+                  { label: 'UYGULANDI', value: String(realOrderStats.applied) },
+                  { label: 'UYGULANAMADI', value: String(realOrderStats.unapplied) },
+                  { label: 'BEKLEMEDE', value: String(realOrderStats.pending) },
+                  {
+                    label: 'BAŞARI ORANI',
+                    value: `%${realOrderStats.successRate.toLocaleString('tr-TR', { maximumFractionDigits: 2 })}`,
+                  },
+                ].map((item) => (
+                  <div key={item.label} className="rounded-lg border border-border/30 bg-secondary/20 p-3">
+                    <p className="text-[10px] text-muted-foreground uppercase tracking-wider mb-1">{item.label}</p>
+                    <p className="text-sm font-semibold text-foreground">{item.value}</p>
+                  </div>
+                ))}
+              </div>
+
+              {orderHistoryRows.length === 0 ? (
+                <div className="rounded-lg border border-border/30 bg-secondary/10 p-6 text-center text-sm text-muted-foreground">
+                  Henüz order denemesi yok.
+                </div>
+              ) : (
+                <div className="overflow-x-auto rounded-lg border border-border/30">
+                  <table className="w-full text-xs">
+                    <thead className="bg-secondary/30 text-muted-foreground">
+                      <tr>
+                        <th className="text-left px-3 py-2">Saat</th>
+                        <th className="text-left px-3 py-2">Wallet</th>
+                        <th className="text-left px-3 py-2">Market</th>
+                        <th className="text-left px-3 py-2">Outcome</th>
+                        <th className="text-left px-3 py-2">Side</th>
+                        <th className="text-left px-3 py-2">Price/Size</th>
+                        <th className="text-left px-3 py-2">Source</th>
+                        <th className="text-left px-3 py-2">Durum</th>
+                        <th className="text-left px-3 py-2">Latency</th>
+                        <th className="text-left px-3 py-2">Hata</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {orderHistoryRows.map((row, index) => {
+                        const statusMeta = getOrderStatusMeta(row.status);
+                        const walletLabel = addresses.find((item) => item.address.toLowerCase() === row.wallet)?.username
+                          || addresses.find((item) => item.address.toLowerCase() === row.wallet)?.label
+                          || row.wallet;
+                        const priceLabel = typeof row.price === 'number'
+                          ? row.price.toLocaleString('tr-TR', { maximumFractionDigits: 4 })
+                          : '-';
+                        const sizeLabel = typeof row.size === 'number'
+                          ? row.size.toLocaleString('tr-TR', { maximumFractionDigits: 6 })
+                          : '-';
+
+                        return (
+                          <tr key={`${row.id}-${index}`} className="border-t border-border/20 align-top">
+                            <td className="px-3 py-2 whitespace-nowrap">{formatDateFromIso(row.order_posted_at || row.created_at)}</td>
+                            <td className="px-3 py-2">
+                              <p className="text-foreground">{walletLabel}</p>
+                              <p className="font-mono text-[10px] text-muted-foreground">{row.wallet}</p>
+                            </td>
+                            <td className="px-3 py-2">{row.market_slug || row.market || '-'}</td>
+                            <td className="px-3 py-2">{row.outcome || '-'}</td>
+                            <td className="px-3 py-2 font-semibold">{row.side || '-'}</td>
+                            <td className="px-3 py-2">
+                              <span className="font-mono">P: {priceLabel}</span>
+                              <br />
+                              <span className="font-mono">S: {sizeLabel}</span>
+                            </td>
+                            <td className="px-3 py-2 uppercase">
+                              {row.source_stage ? `${row.source} • ${row.source_stage}` : row.source}
+                            </td>
+                            <td className={`px-3 py-2 font-semibold ${statusMeta.className}`}>
+                              {statusMeta.icon} {statusMeta.label}
+                            </td>
+                            <td className="px-3 py-2 whitespace-nowrap">
+                              {typeof row.detect_to_order_ms === 'number'
+                                ? `${Math.max(0, Math.round(row.detect_to_order_ms))} ms`
+                                : '-'}
+                            </td>
+                            <td className="px-3 py-2 max-w-[320px]">
+                              <p className="text-destructive break-words">{row.error || '-'}</p>
+                              <details className="mt-1">
+                                <summary className="cursor-pointer text-[10px] text-muted-foreground">Detay</summary>
+                                <div className="mt-1 space-y-1">
+                                  <p className="text-[10px] text-muted-foreground">
+                                    pending: {formatDateFromIso(row.pending_seen_at)} | mined: {formatDateFromIso(row.mined_seen_at)} | decode: {formatDateFromIso(row.decoded_at)}
+                                  </p>
+                                  <p className="text-[10px] text-muted-foreground">
+                                    detect: {formatDateFromIso(row.detected_at)} | post: {formatDateFromIso(row.order_posted_at)}
+                                  </p>
+                                  <pre className="max-h-48 overflow-auto rounded border border-border/30 bg-background/70 p-2 text-[10px] text-muted-foreground">
+                                    {`request:\n${stringifyJson(row.request_payload)}\n\nresponse:\n${stringifyJson(row.response_payload)}`}
+                                  </pre>
+                                </div>
+                              </details>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          )}
+
+          {closedTrades.length > 0 && (
+            <div>
+              <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-3">Kapatılan Tradeler ({closedTrades.length})</h3>
+              <div className="space-y-2 opacity-60">
+                {closedTrades.map(trade => {
+                  const pnl = (trade.currentPrice - trade.entryPrice) * trade.amount * (trade.direction === 'long' ? 1 : -1);
+                  return (
+                    <div key={trade.id} className="glass-card p-3 flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${trade.direction === 'long' ? 'bg-accent/15 text-accent' : 'bg-destructive/15 text-destructive'}`}>{trade.direction.toUpperCase()}</span>
+                        <span className="text-xs text-foreground">{trade.strategy}</span>
+                      </div>
+                      <span className={`text-sm font-bold ${pnl > 0 ? 'text-accent' : 'text-destructive'}`}>{pnl > 0 ? '+' : ''}{pnl.toFixed(2)} $</span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+        </>
+      )}
+
+      {view === 'analysis' && (
+        <div className="glass-card p-4 mb-6">
+          {!analysisStats ? (
+            <div className="text-center py-2">
+              <h3 className="text-sm font-semibold text-foreground mb-2">Copy Trade Analizi • {analysisWalletName || 'Seçili cüzdan'}</h3>
+              <p className="text-sm text-muted-foreground">Henüz bu cüzdan için oluşmuş trade yok. Takip aktifse yeni işlem geldiğinde burada görünecek.</p>
+            </div>
+          ) : (
+            <>
+              <h3 className="text-sm font-semibold text-foreground mb-3">Copy Trade Analizi • {analysisWalletName}</h3>
+              {analysisStrategy && (
+                <p className="mb-3 text-xs text-muted-foreground">Filtrelenen trade stratejisi: <span className="font-semibold text-foreground">{analysisStrategy}</span></p>
+              )}
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 mb-4">
+                {[
+                  { label: 'TRADE BAŞLANGIÇ', value: formatDate(analysisStats.startAt) },
+                  { label: 'TOTAL BUDGET', value: analysisStats.totalBudgetText },
+                  { label: 'SERBEST PARA', value: analysisStats.freeBudgetText },
+                  { label: 'OYUNDAKİ PARA', value: formatUsd(analysisStats.inGameMoney) },
+                  { label: 'TOPLAM İŞLEM', value: String(analysisStats.totalTransactions) },
+                  { label: 'BAŞARI ORANI', value: `%${analysisStats.successRate.toLocaleString('tr-TR', { maximumFractionDigits: 2 })} (${analysisStats.successfulTrades}/${analysisStats.totalTransactions})` },
+                  { label: 'TOTAL BUY', value: formatUsd(analysisStats.totalBuy) },
+                  { label: 'TOTAL SELL', value: formatUsd(analysisStats.totalSell) },
+                ].map((stat) => (
+                  <div key={stat.label} className="stat-card"><p className="text-[10px] text-muted-foreground uppercase tracking-wider mb-2">{stat.label}</p><p className="text-sm font-bold text-foreground break-words">{stat.value}</p></div>
+                ))}
+              </div>
+
+              <div className="grid grid-cols-1 xl:grid-cols-2 gap-4 mb-4">
+                <div className="p-3 rounded-lg border border-border/30 bg-secondary/10">
+                  <h4 className="text-xs font-semibold text-foreground mb-3">Share/Adet Grafiği</h4>
+                  <div className="h-64"><ResponsiveContainer width="100%" height="100%"><ScatterChart margin={{ top: 10, right: 20, bottom: 10, left: 0 }}><CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border) / 0.4)" /><XAxis dataKey="price" type="number" name="Price" tickFormatter={(v) => Number(v).toFixed(2)} stroke="hsl(var(--muted-foreground))" /><YAxis dataKey="share" type="number" name="Share" stroke="hsl(var(--muted-foreground))" /><Tooltip cursor={{ strokeDasharray: '4 4' }} formatter={(value: number) => Number(value).toLocaleString('tr-TR', { maximumFractionDigits: 6 })} /><Scatter data={sharePriceData.map((item) => ({ price: item.price, share: item.share }))} fill="hsl(var(--primary))" /></ScatterChart></ResponsiveContainer></div>
+                </div>
+                <div className="p-3 rounded-lg border border-border/30 bg-secondary/10">
+                  <h4 className="text-xs font-semibold text-foreground mb-3">Price/Adet Grafiği</h4>
+                  <div className="h-64"><ResponsiveContainer width="100%" height="100%"><ScatterChart margin={{ top: 10, right: 20, bottom: 10, left: 0 }}><CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border) / 0.4)" /><XAxis dataKey="price" type="number" name="Price" tickFormatter={(v) => Number(v).toFixed(2)} stroke="hsl(var(--muted-foreground))" /><YAxis dataKey="usdSpent" type="number" name="USD" stroke="hsl(var(--muted-foreground))" /><Tooltip cursor={{ strokeDasharray: '4 4' }} formatter={(value: number) => Number(value).toLocaleString('tr-TR', { style: 'currency', currency: 'USD' })} /><Scatter data={sharePriceData.map((item) => ({ price: item.price, usdSpent: item.usdSpent }))} fill="hsl(var(--accent))" /></ScatterChart></ResponsiveContainer></div>
+                </div>
+              </div>
+
+
+              <div className="p-3 rounded-lg border border-border/30 bg-secondary/10">
+                <h4 className="text-xs font-semibold text-foreground mb-2">Son Aktiviteler</h4>
+                <div className="space-y-2">
+                  {myActivities.slice(0, visibleActivityCount).map((activity) => (
+                    <div key={activity.id} className="flex items-center justify-between border-b border-border/20 pb-2 last:border-0 last:pb-0">
+                      <div className="flex items-center gap-3">
+                        <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${activity.side === 'BUY' ? 'bg-accent/10' : 'bg-warning/10'}`}>
+                          {activity.side === 'BUY' ? <ArrowDownRight className="w-4 h-4 text-accent" /> : <ArrowUpRight className="w-4 h-4 text-warning" />}
+                        </div>
+                        <div>
+                          <p className="text-xs font-medium text-foreground">{activity.market}</p>
+                          <p className="font-mono text-[10px] text-muted-foreground">{activity.outcome}</p>
+                          <p className="text-[10px] text-muted-foreground">{activity.side} • {formatDate(activity.occurredAt)}</p>
+                        </div>
+                      </div>
+                      <p className="text-xs text-foreground text-right">
+                        {activityQuotes[activity.id]
+                          ? `Fark: ${Math.abs(activityQuotes[activity.id].diffPrice) <= (analysisSlippageCents / 100) ? '✅ ' : '❌ '}${formatSignedPrice(activityQuotes[activity.id].diffPrice)} • Canlı ${activityQuotes[activity.id].benchmarkLabel}: ${formatPrice(activityQuotes[activity.id].benchmarkPrice)} • `
+                          : ''}
+                        Price: {activity.price.toLocaleString('tr-TR', { maximumFractionDigits: 2 })} • Share: {activity.share.toLocaleString('tr-TR', { maximumFractionDigits: 6 })} • USD: {activity.usd.toLocaleString('tr-TR', { maximumFractionDigits: 2 })}
+                      </p>
+                    </div>
+                  ))}
+                  {myActivities.length > visibleActivityCount && (
+                    <div className="pt-1">
+                      <button
+                        type="button"
+                        className="w-full px-3 py-2 text-xs rounded-lg border border-border/40 bg-secondary/20 hover:bg-secondary/35 transition-colors"
+                        onClick={() => setVisibleActivityCount((prev) => prev + 20)}
+                      >
+                        Daha Fazla
+                      </button>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
