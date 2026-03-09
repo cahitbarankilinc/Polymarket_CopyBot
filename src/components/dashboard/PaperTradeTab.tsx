@@ -223,7 +223,8 @@ const formatSignedPrice = (value: number) => `${value > 0 ? '+' : ''}${value.toL
 const getOrderStatusMeta = (statusRaw?: string | null) => {
   const status = (statusRaw ?? '').trim().toLowerCase();
   if (status === 'matched') return { icon: '✅', label: 'matched', className: 'text-emerald-600' };
-  if (status === 'live') return { icon: '☑️', label: 'live', className: 'text-sky-600' };
+  if (status === 'live' || status === 'live_open') return { icon: '⏳', label: 'open', className: 'text-amber-600' };
+  if (status === 'cancelled_after_timeout') return { icon: '❌', label: 'cancelled', className: 'text-orange-600' };
   if (status === 'error' || status === 'blocked') return { icon: '❌', label: status || 'error', className: 'text-destructive' };
   if (status === 'pending') return { icon: '⏳', label: 'pending', className: 'text-amber-600' };
   return { icon: '⏳', label: status || 'pending', className: 'text-muted-foreground' };
@@ -236,6 +237,45 @@ const stringifyJson = (value: unknown): string => {
   } catch {
     return String(value);
   }
+};
+
+const extractOrderIdFromPayload = (payload: unknown): string | null => {
+  if (!payload || typeof payload !== 'object') return null;
+  const record = payload as Record<string, unknown>;
+
+  if (typeof record.openOrderId === 'string' && record.openOrderId.trim()) return record.openOrderId;
+  if (typeof record.orderId === 'string' && record.orderId.trim()) return record.orderId;
+  if (typeof record.orderID === 'string' && record.orderID.trim()) return record.orderID;
+
+  const rawResponse = record.rawResponse;
+  if (rawResponse && typeof rawResponse === 'object') {
+    const rawOrderId = (rawResponse as Record<string, unknown>).orderID;
+    if (typeof rawOrderId === 'string' && rawOrderId.trim()) return rawOrderId;
+  }
+
+  const script = record.script;
+  if (script && typeof script === 'object') {
+    const place = (script as Record<string, unknown>).place;
+    if (place && typeof place === 'object') {
+      const placeResponse = (place as Record<string, unknown>).response;
+      if (placeResponse && typeof placeResponse === 'object') {
+        const placeOrderId = (placeResponse as Record<string, unknown>).orderID;
+        if (typeof placeOrderId === 'string' && placeOrderId.trim()) return placeOrderId;
+      }
+    }
+    const scriptResponse = (script as Record<string, unknown>).response;
+    if (scriptResponse && typeof scriptResponse === 'object') {
+      const scriptOrderId = (scriptResponse as Record<string, unknown>).orderID;
+      if (typeof scriptOrderId === 'string' && scriptOrderId.trim()) return scriptOrderId;
+    }
+  }
+
+  return null;
+};
+
+const compactOrderId = (value: string): string => {
+  if (value.length <= 18) return value;
+  return `${value.slice(0, 10)}...${value.slice(-8)}`;
 };
 
 const parseSlippageCents = (value: string | undefined): number => {
@@ -323,16 +363,19 @@ const describeSessionConfig = (config: WalletModeConfig): string => {
   const modeLabel = COPY_MODE_OPTIONS.find((option) => option.value === config.mode)?.label || config.mode;
 
   let modeDetail = '';
-  if (config.mode === 'multiplier') modeDetail = `Multiplier: ${config.multiplier || '-'}`;
-  else if (config.mode === 'fixed-amount') modeDetail = `Sabit Tutar: $${config.fixedAmount || '-'}`;
-  else if (config.mode === 'buy-wait') modeDetail = `Buy-Wait Limit: ${config.buyWaitLimit || '-'} • Sabit Tutar: $${config.fixedAmount || '-'}`;
-  else if (config.mode === 'proportional') modeDetail = `Leader Bakiye: $${config.leaderFreeBalance || '-'}`;
-  else modeDetail = `Kaynak Trade: $${config.sourceTradeUsd || '-'}`;
+  if (config.mode === 'multiplier') modeDetail = `Trade USD × ${config.multiplier || '-'}`;
+  else if (config.mode === 'fixed-amount') modeDetail = `Her event sabit $${config.fixedAmount || '-'}`;
+  else if (config.mode === 'buy-wait') modeDetail = `İlk ${config.buyWaitLimit || '-'} BUY için sabit $${config.fixedAmount || '-'}`;
+  else if (config.mode === 'proportional') modeDetail = `Leader free balance: $${config.leaderFreeBalance || '-'}`;
+  else modeDetail = 'Kaynak trade USD notional kopyalanır';
 
   const slippage = config.slippageCents || '0';
   const centRangeLabel = `${config.centRangeMin || '1'}-${config.centRangeMax || '99'}¢`;
   const shareRangeLabel = `${config.shareRangeMin || '2'}-${config.shareRangeMax || '∞'}`;
-  return `Opsiyon: ${modeLabel} • ${modeDetail} • Slippage: ${slippage}¢ • Cent: ${centRangeLabel} • Share: ${shareRangeLabel}`;
+  const executionDetail = config.useSlippage
+    ? `Quote uygunsa GTC limit (${slippage}¢ slippage)`
+    : 'Market-like FAK';
+  return `Opsiyon: ${modeLabel} • ${modeDetail} • ${executionDetail} • Cent: ${centRangeLabel} • Share: ${shareRangeLabel}`;
 };
 
 const toEventTimestamp = (event: WalletTrackerEvent): number => {
@@ -780,14 +823,22 @@ export default function PaperTradeTab({
   const realOrderStats = useMemo(() => {
     if (orderStats) return orderStats;
     const total = orderHistoryRows.length;
-    const applied = orderHistoryRows.filter((row) => row.status === 'matched' || row.status === 'live').length;
-    const unapplied = orderHistoryRows.filter((row) => row.status === 'error' || row.status === 'blocked').length;
-    const pending = Math.max(0, total - applied - unapplied);
-    const denominator = applied + unapplied;
-    const successRate = denominator > 0 ? Number(((applied / denominator) * 100).toFixed(2)) : 0;
+    const matched = orderHistoryRows.filter((row) => row.status === 'matched').length;
+    const open = orderHistoryRows.filter((row) => row.status === 'live_open' || row.status === 'live').length;
+    const cancelled = orderHistoryRows.filter((row) => row.status === 'cancelled_after_timeout').length;
+    const failed = orderHistoryRows.filter((row) => row.status === 'error' || row.status === 'blocked').length;
+    const applied = matched;
+    const unapplied = cancelled + failed;
+    const pending = open;
+    const denominator = matched + cancelled + failed;
+    const successRate = denominator > 0 ? Number(((matched / denominator) * 100).toFixed(2)) : 0;
     return {
       generatedAt: new Date().toISOString(),
       total,
+      matched,
+      open,
+      cancelled,
+      failed,
       applied,
       unapplied,
       pending,
@@ -1657,12 +1708,13 @@ export default function PaperTradeTab({
                   {isClearingOrderHistory ? 'Temizleniyor...' : 'Geçmişi Temizle'}
                 </button>
               </div>
-              <div className="grid grid-cols-2 lg:grid-cols-5 gap-2 mb-4">
+              <div className="grid grid-cols-2 lg:grid-cols-6 gap-2 mb-4">
                 {[
                   { label: 'TOPLAM', value: String(realOrderStats.total) },
-                  { label: 'UYGULANDI', value: String(realOrderStats.applied) },
-                  { label: 'UYGULANAMADI', value: String(realOrderStats.unapplied) },
-                  { label: 'BEKLEMEDE', value: String(realOrderStats.pending) },
+                  { label: 'MATCHED', value: String(realOrderStats.matched ?? realOrderStats.applied) },
+                  { label: 'AÇIK EMİR', value: String(realOrderStats.open ?? realOrderStats.pending) },
+                  { label: 'İPTAL', value: String(realOrderStats.cancelled ?? 0) },
+                  { label: 'HATA/BLOK', value: String(realOrderStats.failed ?? Math.max(0, realOrderStats.unapplied - (realOrderStats.cancelled ?? 0))) },
                   {
                     label: 'BAŞARI ORANI',
                     value: `%${realOrderStats.successRate.toLocaleString('tr-TR', { maximumFractionDigits: 2 })}`,
@@ -1699,6 +1751,7 @@ export default function PaperTradeTab({
                     <tbody>
                       {orderHistoryRows.map((row, index) => {
                         const statusMeta = getOrderStatusMeta(row.status);
+                        const orderId = extractOrderIdFromPayload(row.response_payload);
                         const walletLabel = addresses.find((item) => item.address.toLowerCase() === row.wallet)?.username
                           || addresses.find((item) => item.address.toLowerCase() === row.wallet)?.label
                           || row.wallet;
@@ -1708,6 +1761,25 @@ export default function PaperTradeTab({
                         const sizeLabel = typeof row.size === 'number'
                           ? row.size.toLocaleString('tr-TR', { maximumFractionDigits: 6 })
                           : '-';
+                        const usdLabel = typeof row.value_usd === 'number'
+                          ? row.value_usd.toLocaleString('tr-TR', { maximumFractionDigits: 4 })
+                          : '-';
+                        const responsePayload = row.response_payload as Record<string, unknown> | null;
+                        const submittedSize = responsePayload && typeof responsePayload.submittedSize === 'number'
+                          ? responsePayload.submittedSize.toLocaleString('tr-TR', { maximumFractionDigits: 6 })
+                          : '-';
+                        const requestedPrice = responsePayload && typeof responsePayload.requestedPrice === 'number'
+                          ? responsePayload.requestedPrice.toLocaleString('tr-TR', { maximumFractionDigits: 6 })
+                          : '-';
+                        const limitPrice = responsePayload && typeof responsePayload.limitPrice === 'number'
+                          ? responsePayload.limitPrice.toLocaleString('tr-TR', { maximumFractionDigits: 6 })
+                          : '-';
+                        const marketQuotePrice = responsePayload && typeof responsePayload.marketQuotePrice === 'number'
+                          ? responsePayload.marketQuotePrice.toLocaleString('tr-TR', { maximumFractionDigits: 6 })
+                          : '-';
+                        const tradeUsd = responsePayload && typeof responsePayload.tradeUsd === 'number'
+                          ? responsePayload.tradeUsd.toLocaleString('tr-TR', { maximumFractionDigits: 6 })
+                          : usdLabel;
 
                         return (
                           <tr key={`${row.id}-${index}`} className="border-t border-border/20 align-top">
@@ -1723,12 +1795,27 @@ export default function PaperTradeTab({
                               <span className="font-mono">P: {priceLabel}</span>
                               <br />
                               <span className="font-mono">S: {sizeLabel}</span>
+                              <br />
+                              <span className="font-mono text-[10px] text-muted-foreground">USD: {usdLabel}</span>
                             </td>
                             <td className="px-3 py-2 uppercase">
                               {row.source_stage ? `${row.source} • ${row.source_stage}` : row.source}
+                              {(row.order_kind || row.order_type) && (
+                                <>
+                                  <br />
+                                  <span className="text-[10px] text-muted-foreground normal-case">
+                                    {row.order_kind || '-'} / {row.order_type || '-'}
+                                  </span>
+                                </>
+                              )}
                             </td>
                             <td className={`px-3 py-2 font-semibold ${statusMeta.className}`}>
-                              {statusMeta.icon} {statusMeta.label}
+                              <p>{statusMeta.icon} {statusMeta.label}</p>
+                              {orderId && (
+                                <p className="font-mono text-[10px] text-muted-foreground" title={orderId}>
+                                  {compactOrderId(orderId)}
+                                </p>
+                              )}
                             </td>
                             <td className="px-3 py-2 whitespace-nowrap">
                               {typeof row.detect_to_order_ms === 'number'
@@ -1740,6 +1827,15 @@ export default function PaperTradeTab({
                               <details className="mt-1">
                                 <summary className="cursor-pointer text-[10px] text-muted-foreground">Detay</summary>
                                 <div className="mt-1 space-y-1">
+                                  <p className="text-[10px] text-muted-foreground">
+                                    source event: price {priceLabel} | size {sizeLabel} | usd {usdLabel}
+                                  </p>
+                                  <p className="text-[10px] text-muted-foreground">
+                                    request: {row.order_kind || '-'} / {row.order_type || '-'} / {row.quantity_kind || '-'} | requestPrice {requestedPrice} | quote {marketQuotePrice} | limit {limitPrice} | submitted {submittedSize} | tradeUsd {tradeUsd}
+                                  </p>
+                                  <p className="text-[10px] text-muted-foreground">
+                                    final: {row.final_status || row.status} | openOrder: {row.open_order_id || '-'} | cancelled: {formatDateFromIso(row.cancelled_at)}
+                                  </p>
                                   <p className="text-[10px] text-muted-foreground">
                                     pending: {formatDateFromIso(row.pending_seen_at)} | mined: {formatDateFromIso(row.mined_seen_at)} | decode: {formatDateFromIso(row.decoded_at)}
                                   </p>

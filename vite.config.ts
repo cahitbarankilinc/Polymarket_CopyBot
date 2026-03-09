@@ -35,7 +35,7 @@ if (fs.existsSync(localEnvPath)) {
 }
 
 const POLL_INTERVAL_MS = 2000;
-const FETCH_TIMEOUT_MS = Number(process.env.POLYMARKET_FETCH_TIMEOUT_MS ?? 1800);
+const FETCH_TIMEOUT_MS = Number(process.env.POLYMARKET_FETCH_TIMEOUT_MS ?? 5000);
 const MAX_RECENT_SEEN_IDS = 1500;
 const POLY_ALCHEMY_API_KEY = (process.env.POLY_ALCHEMY_API_KEY ?? "").trim();
 const POLY_ALCHEMY_WS_URL = (process.env.POLY_ALCHEMY_WS_URL ?? "").trim();
@@ -63,6 +63,7 @@ const SHARED_SCRAPER_PROFILE_DIR = SCRAPER_PROFILE_DIR;
 const PROFILE_TRADES_REFRESH_MS = 60 * 60 * 1000;
 const SCRAPER_MAX_RUN_MS = Number(process.env.POLYMARKET_SCRAPER_TIMEOUT_MS ?? 180000);
 const REAL_ORDER_TIMEOUT_MS = Number(process.env.POLYMARKET_REAL_ORDER_TIMEOUT_MS ?? 45000);
+const LIVE_ORDER_CANCEL_AFTER_MS = Math.max(1000, Number(process.env.POLYMARKET_LIVE_CANCEL_AFTER_MS ?? 5000));
 const POLYMARKET_PRIVATE_KEY = (process.env.POLYMARKET_PRIVATE_KEY ?? "").trim();
 const POLYMARKET_FUNDER_ADDRESS = (process.env.POLYMARKET_FUNDER_ADDRESS ?? "").trim();
 const DEFAULT_REAL_ORDER_SLIPPAGE_CENTS = Math.max(0, Number(process.env.POLYMARKET_DEFAULT_SLIPPAGE_CENTS ?? 5));
@@ -168,6 +169,7 @@ type RealTradeOrderRequest = {
   side?: string;
   price?: number;
   size?: number;
+  tradeUsd?: number;
   slippageCents?: number;
   assetId?: string;
   walletAddress?: string;
@@ -176,6 +178,9 @@ type RealTradeOrderRequest = {
   requestId?: string;
   skipMarketLookup?: boolean;
 };
+
+type RealTradeOrderKind = "limit" | "market-like";
+type RealTradeOrderType = "GTC" | "FAK" | "FOK" | "GTD";
 
 type BackendCopyMode = "notional" | "proportional" | "multiplier" | "fixed-amount" | "fixed-shares" | "buy-wait";
 
@@ -216,6 +221,7 @@ type BackendCopySession = {
 
 type RealTradeScriptPayload = {
   success: boolean;
+  action?: string;
   status?: string | null;
   response?: Record<string, unknown> | null;
   error?: string;
@@ -225,6 +231,9 @@ type RealTradeScriptPayload = {
   side?: string;
   price?: number;
   size?: number;
+  orderId?: string | null;
+  orderKind?: RealTradeOrderKind;
+  orderType?: RealTradeOrderType;
 };
 
 const runtimes = new Map<string, TrackerRuntime>();
@@ -883,6 +892,84 @@ const getLiveQuote = async (marketSlug: string, outcome: string): Promise<Market
   return value;
 };
 
+const getBookQuoteByAssetId = async (
+  assetId: string,
+  marketSlug?: string,
+  outcome?: string,
+): Promise<MarketQuote | null> => {
+  const cleanAssetId = assetId.trim();
+  if (!cleanAssetId) return null;
+
+  const bookResponse = await fetch(`https://clob.polymarket.com/book?token_id=${encodeURIComponent(cleanAssetId)}`, { cache: "no-store" });
+  if (!bookResponse.ok) return null;
+
+  const bookPayload = await bookResponse.json() as Record<string, unknown>;
+  const bids = Array.isArray(bookPayload.bids) ? bookPayload.bids : [];
+  const asks = Array.isArray(bookPayload.asks) ? bookPayload.asks : [];
+
+  let bid: number | null = null;
+  let ask: number | null = null;
+
+  const bidPrices = bids
+    .map((row) => (row && typeof row === "object" ? toFloat((row as Record<string, unknown>).price) : null))
+    .filter((price): price is number => typeof price === "number");
+  if (bidPrices.length > 0) bid = Math.max(...bidPrices);
+
+  const askPrices = asks
+    .map((row) => (row && typeof row === "object" ? toFloat((row as Record<string, unknown>).price) : null))
+    .filter((price): price is number => typeof price === "number");
+  if (askPrices.length > 0) ask = Math.min(...askPrices);
+
+  return {
+    market: marketSlug?.trim() || `asset-${cleanAssetId.slice(0, 12)}`,
+    outcome: outcome?.trim() || "Unknown",
+    assetId: cleanAssetId,
+    bid,
+    ask,
+    bidCents: bid === null ? null : Number((bid * 100).toFixed(4)),
+    askCents: ask === null ? null : Number((ask * 100).toFixed(4)),
+  };
+};
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const normalizeOrderTypeValue = (value: unknown): RealTradeOrderType => {
+  const normalized = typeof value === "string" ? value.trim().toUpperCase() : "";
+  if (normalized === "FAK" || normalized === "FOK" || normalized === "GTD") return normalized;
+  return "GTC";
+};
+
+const normalizeOrderLifecycleStatus = (value: unknown): string => {
+  const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
+  if (!normalized) return "";
+  if (normalized === "matched" || normalized === "filled" || normalized === "complete" || normalized === "completed") {
+    return "matched";
+  }
+  if (normalized === "cancelled" || normalized === "canceled") {
+    return "cancelled";
+  }
+  if (normalized === "error" || normalized === "failed" || normalized === "rejected") {
+    return "error";
+  }
+  if (normalized === "live" || normalized === "open" || normalized === "delayed" || normalized === "pending") {
+    return "live";
+  }
+  return normalized;
+};
+
+const extractOrderIdFromPayload = (payload: unknown): string | null => {
+  if (!payload || typeof payload !== "object") return null;
+  const record = payload as Record<string, unknown>;
+  const directOrderId = record.orderId ?? record.orderID;
+  if (typeof directOrderId === "string" && directOrderId.trim()) return directOrderId.trim();
+  const response = record.response;
+  if (response && typeof response === "object") {
+    const responseOrderId = (response as Record<string, unknown>).orderId ?? (response as Record<string, unknown>).orderID;
+    if (typeof responseOrderId === "string" && responseOrderId.trim()) return responseOrderId.trim();
+  }
+  return null;
+};
+
 const parseJsonFromOutput = (output: string): Record<string, unknown> | null => {
   const lines = output
     .split(/\r?\n/)
@@ -1006,13 +1093,19 @@ const isTradeEvent = (event: RuntimeNormalizedEvent): boolean => {
 
 const isEventInConfiguredRanges = (eventPrice: number, eventSize: number, config: BackendCopySessionConfig): boolean => {
   const eventCent = eventPrice * 100;
-  const centMin = config.centRangeMin ?? 1;
-  const centMax = config.centRangeMax ?? 99;
-  if (eventCent < centMin || eventCent > centMax) return false;
 
-  const shareMin = config.shareRangeMin ?? 0;
-  if (eventSize < shareMin) return false;
-  if (config.shareRangeMax !== null && eventSize > config.shareRangeMax) return false;
+  const hasCentMin = config.centRangeMin !== null;
+  const hasCentMax = config.centRangeMax !== null;
+  if (hasCentMin || hasCentMax) {
+    const centMin = hasCentMin ? (config.centRangeMin as number) : 1;
+    const centMax = hasCentMax ? (config.centRangeMax as number) : 99;
+    if (eventCent < centMin || eventCent > centMax) return false;
+  }
+
+  const hasShareMin = config.shareRangeMin !== null;
+  const hasShareMax = config.shareRangeMax !== null;
+  if (hasShareMin && eventSize < (config.shareRangeMin as number)) return false;
+  if (hasShareMax && eventSize > (config.shareRangeMax as number)) return false;
   return true;
 };
 
@@ -1212,6 +1305,7 @@ const getPythonOrderWorker = () => {
 };
 
 const runRealTradeScriptViaWorker = async (input: {
+  action?: "place" | "get" | "cancel";
   marketSlug: string;
   outcome: string;
   assetId: string;
@@ -1221,12 +1315,16 @@ const runRealTradeScriptViaWorker = async (input: {
   privateKey?: string;
   funderAddress?: string;
   signatureType: number;
+  orderKind?: RealTradeOrderKind;
+  orderType?: RealTradeOrderType;
+  orderId?: string;
 }): Promise<RealTradeScriptPayload> => {
   const worker = getPythonOrderWorker();
   const reqId = crypto.randomUUID();
   const payload = {
     id: reqId,
     payload: {
+      action: input.action ?? "place",
       marketSlug: input.marketSlug,
       outcome: input.outcome,
       assetId: input.assetId,
@@ -1236,6 +1334,9 @@ const runRealTradeScriptViaWorker = async (input: {
       privateKey: input.privateKey ?? "",
       signatureType: input.signatureType,
       funderAddress: input.funderAddress ?? "",
+      orderKind: input.orderKind ?? "limit",
+      orderType: input.orderType ?? "GTC",
+      orderId: input.orderId ?? "",
     },
   };
 
@@ -1258,6 +1359,7 @@ const runRealTradeScriptViaWorker = async (input: {
 };
 
 const runRealTradeScript = async (input: {
+  action?: "place" | "get" | "cancel";
   marketSlug: string;
   outcome: string;
   assetId: string;
@@ -1267,6 +1369,9 @@ const runRealTradeScript = async (input: {
   privateKey?: string;
   funderAddress?: string;
   signatureType: number;
+  orderKind?: RealTradeOrderKind;
+  orderType?: RealTradeOrderType;
+  orderId?: string;
 }): Promise<RealTradeScriptPayload> => {
   if (USE_PERSISTENT_ORDER_WORKER) {
     try {
@@ -1284,6 +1389,8 @@ const runRealTradeScript = async (input: {
     const args = [
       ...baseArgs,
       REAL_TRADE_SCRIPT_PATH,
+      "--action",
+      input.action ?? "place",
       "--market-slug",
       input.marketSlug,
       "--outcome",
@@ -1298,8 +1405,15 @@ const runRealTradeScript = async (input: {
       String(input.size),
       "--signature-type",
       String(input.signatureType),
+      "--order-kind",
+      input.orderKind ?? "limit",
+      "--order-type",
+      input.orderType ?? "GTC",
       "--json",
     ];
+    if (input.orderId?.trim()) {
+      args.push("--order-id", input.orderId.trim());
+    }
 
     const privateKey = (input.privateKey ?? "").trim();
     const funderAddress = (input.funderAddress ?? "").trim();
@@ -1360,26 +1474,25 @@ const executeRealTradeOrder = async (raw: RealTradeOrderRequest) => {
   let marketSlug = String(raw.marketSlug ?? raw.market ?? "").trim();
   let outcome = String(raw.outcome ?? "").trim();
   const side = normalizeSideValue(raw.side);
-  const price = toPositiveFiniteNumber(raw.price);
-  const size = toPositiveFiniteNumber(raw.size);
+  const sourcePrice = toPositiveFiniteNumber(raw.price);
+  const sourceSize = toPositiveFiniteNumber(raw.size);
   const skipMarketLookup = raw.skipMarketLookup === true;
-  const slippageCents = skipMarketLookup ? 0 : Math.max(0, toFloat(raw.slippageCents) ?? 0);
+  const useSlippage = !skipMarketLookup;
+  const slippageCents = useSlippage ? Math.max(0, toFloat(raw.slippageCents) ?? 0) : 0;
 
   if (!side) throw new Error("side sadece BUY veya SELL olabilir");
-  if (price === null) throw new Error("price 0'dan büyük sayı olmalı");
-  if (size === null) throw new Error("size 0'dan büyük sayı olmalı");
+  if (sourcePrice === null) throw new Error("price 0'dan büyük sayı olmalı");
+  if (sourceSize === null) throw new Error("size 0'dan büyük sayı olmalı");
+
+  const tradeUsd = toPositiveFiniteNumber(raw.tradeUsd ?? Number((sourcePrice * sourceSize).toFixed(6)));
+  if (tradeUsd === null) throw new Error("tradeUsd 0'dan büyük sayı olmalı");
 
   let assetId = String(raw.assetId ?? "").trim();
-  if (!assetId && !skipMarketLookup && (!marketSlug || !outcome)) {
+  if (!assetId && useSlippage && (!marketSlug || !outcome)) {
     throw new Error("market/outcome veya assetId zorunludur");
   }
-  if (!assetId && skipMarketLookup) {
+  if (!assetId && !useSlippage) {
     throw new Error("assetId zorunlu (instant mode)");
-  }
-
-  const limitPrice = Number((price + (slippageCents / 100)).toFixed(6));
-  if (!Number.isFinite(limitPrice) || limitPrice <= 0) {
-    throw new Error("Hesaplanan limitPrice geçersiz");
   }
 
   if (!assetId) {
@@ -1393,51 +1506,227 @@ const executeRealTradeOrder = async (raw: RealTradeOrderRequest) => {
   if (!marketSlug) marketSlug = `asset-${assetId.slice(0, 12)}`;
   if (!outcome) outcome = "Unknown";
 
+  let orderKind: RealTradeOrderKind = useSlippage ? "limit" : "market-like";
+  let orderType: RealTradeOrderType = useSlippage ? "GTC" : "FAK";
+  let quantityKind: "usd" | "shares" = side === "BUY" && !useSlippage ? "usd" : "shares";
+  let limitPrice: number | null = null;
+  let submittedSize = sourceSize;
+  let marketQuotePrice: number | null = null;
+  let quote: MarketQuote | null = null;
+
+  if (useSlippage) {
+    quote = await getBookQuoteByAssetId(assetId, marketSlug, outcome);
+    if (!quote) {
+      throw new Error("Canlı quote alınamadı");
+    }
+
+    const bestPrice = side === "BUY" ? quote.ask : quote.bid;
+    if (!Number.isFinite(bestPrice ?? Number.NaN) || bestPrice === null || bestPrice <= 0) {
+      throw new Error(side === "BUY" ? "Best ask bulunamadı" : "Best bid bulunamadı");
+    }
+
+    marketQuotePrice = Number(bestPrice.toFixed(6));
+    const slippageDelta = slippageCents / 100;
+    const withinSlippage = side === "BUY"
+      ? marketQuotePrice <= sourcePrice + slippageDelta
+      : marketQuotePrice >= sourcePrice - slippageDelta;
+
+    if (!withinSlippage) {
+      const postedAt = utcNowIso();
+      const detectTs = Date.parse(detectedAt);
+      const postedTs = Date.parse(postedAt);
+      const detectToOrderMs = Number.isFinite(detectTs) && Number.isFinite(postedTs)
+        ? Math.max(0, postedTs - detectTs)
+        : null;
+
+      return {
+        ok: false,
+        resultIcon: "❌",
+        status: "blocked",
+        finalStatus: "blocked",
+        error: side === "BUY"
+          ? `Canlı ask slippage dışında (${marketQuotePrice.toFixed(4)} > ${(sourcePrice + slippageDelta).toFixed(4)})`
+          : `Canlı bid slippage dışında (${marketQuotePrice.toFixed(4)} < ${(sourcePrice - slippageDelta).toFixed(4)})`,
+        marketSlug,
+        outcome,
+        side,
+        assetId,
+        requestedPrice: sourcePrice,
+        marketQuotePrice,
+        limitPrice: marketQuotePrice,
+        size: sourceSize,
+        submittedSize: null,
+        sourceSize,
+        sourceValueUsd: tradeUsd,
+        tradeUsd,
+        slippageCents,
+        quantityKind,
+        walletAddress: walletAddress || null,
+        source,
+        requestId,
+        detectedAt,
+        postedAt,
+        detectToOrderMs,
+        attemptCount: 0,
+        orderKind,
+        orderType,
+        rawResponse: null,
+        orderStateResponse: null,
+        cancelResponse: null,
+        openOrderId: null,
+        cancelledAt: null,
+      };
+    }
+
+    limitPrice = marketQuotePrice;
+    submittedSize = Number((tradeUsd / limitPrice).toFixed(6));
+    quantityKind = "shares";
+  } else {
+    limitPrice = null;
+    submittedSize = side === "BUY"
+      ? Number(tradeUsd.toFixed(6))
+      : Number((tradeUsd / sourcePrice).toFixed(6));
+  }
+
+  if (!Number.isFinite(submittedSize) || submittedSize <= 0) {
+    throw new Error("Hesaplanan emir boyutu geçersiz");
+  }
+
   let scriptPayload: RealTradeScriptPayload | null = null;
   const attemptCount = 1;
   try {
     scriptPayload = await runRealTradeScript({
+      action: "place",
       marketSlug,
       outcome,
       assetId,
       side,
-      price: limitPrice,
-      size,
+      price: limitPrice ?? 0,
+      size: submittedSize,
       privateKey: POLYMARKET_PRIVATE_KEY || undefined,
       funderAddress: POLYMARKET_FUNDER_ADDRESS || undefined,
       signatureType: 1,
+      orderKind,
+      orderType,
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Real order script failed";
     throw new Error(message);
   }
 
-  const normalizedStatus = typeof scriptPayload.status === "string" ? scriptPayload.status.toLowerCase() : "";
-  const resultIcon = normalizedStatus === "matched"
-    ? "✅"
-    : normalizedStatus === "live"
-      ? "☑️"
-      : "❌";
-
+  const rawStatus = normalizeOrderLifecycleStatus(scriptPayload.status);
   const postedAt = utcNowIso();
   const detectTs = Date.parse(detectedAt);
   const postedTs = Date.parse(postedAt);
   const detectToOrderMs = Number.isFinite(detectTs) && Number.isFinite(postedTs)
     ? Math.max(0, postedTs - detectTs)
     : null;
+  const openOrderId = extractOrderIdFromPayload(scriptPayload) ?? null;
+
+  let status = rawStatus || "error";
+  let finalStatus = status;
+  let resultIcon: "✅" | "⏳" | "❌" = "❌";
+  let orderStateResponse: Record<string, unknown> | null = null;
+  let cancelResponse: Record<string, unknown> | null = null;
+  let cancelledAt: string | null = null;
+
+  if (status === "matched") {
+    resultIcon = "✅";
+  } else if (status === "live") {
+    if (useSlippage && openOrderId) {
+      await sleep(LIVE_ORDER_CANCEL_AFTER_MS);
+
+      try {
+        const orderStatePayload = await runRealTradeScript({
+          action: "get",
+          marketSlug,
+          outcome,
+          assetId,
+          side,
+          price: limitPrice ?? 0,
+          size: submittedSize,
+          privateKey: POLYMARKET_PRIVATE_KEY || undefined,
+          funderAddress: POLYMARKET_FUNDER_ADDRESS || undefined,
+          signatureType: 1,
+          orderKind,
+          orderType,
+          orderId: openOrderId,
+        });
+        orderStateResponse = orderStatePayload.response ?? null;
+        const orderStateStatus = normalizeOrderLifecycleStatus(orderStatePayload.status);
+        if (orderStateStatus === "matched") {
+          status = "matched";
+          finalStatus = "matched";
+          resultIcon = "✅";
+        } else {
+          const cancelPayload = await runRealTradeScript({
+            action: "cancel",
+            marketSlug,
+            outcome,
+            assetId,
+            side,
+            price: limitPrice ?? 0,
+            size: submittedSize,
+            privateKey: POLYMARKET_PRIVATE_KEY || undefined,
+            funderAddress: POLYMARKET_FUNDER_ADDRESS || undefined,
+            signatureType: 1,
+            orderKind,
+            orderType,
+            orderId: openOrderId,
+          });
+          cancelResponse = cancelPayload.response ?? null;
+          cancelledAt = utcNowIso();
+          const cancelStatus = normalizeOrderLifecycleStatus(cancelPayload.status);
+          if (cancelStatus === "matched") {
+            status = "matched";
+            finalStatus = "matched";
+            resultIcon = "✅";
+          } else {
+            status = cancelPayload.success || cancelStatus === "cancelled"
+              ? "cancelled_after_timeout"
+              : "live_open";
+            finalStatus = status;
+            resultIcon = status === "live_open" ? "⏳" : "❌";
+          }
+        }
+      } catch (error) {
+        status = "live_open";
+        finalStatus = "live_open";
+        resultIcon = "⏳";
+        cancelResponse = {
+          error: error instanceof Error ? error.message : "Live order lifecycle check failed",
+        };
+      }
+    } else {
+      status = "live_open";
+      finalStatus = "live_open";
+      resultIcon = "⏳";
+    }
+  }
+
+  if (status === "error" || status === "blocked" || status === "cancelled_after_timeout") {
+    resultIcon = "❌";
+  }
 
   return {
-    ok: resultIcon !== "❌",
+    ok: status === "matched",
     resultIcon,
-    status: normalizedStatus || "error",
+    status,
+    finalStatus,
     marketSlug,
     outcome,
     side,
     assetId,
-    requestedPrice: price,
+    requestedPrice: sourcePrice,
+    marketQuotePrice,
     limitPrice,
-    size,
+    size: sourceSize,
+    submittedSize,
+    sourceSize,
+    sourceValueUsd: tradeUsd,
+    tradeUsd,
     slippageCents,
+    quantityKind,
     walletAddress: walletAddress || null,
     source,
     requestId,
@@ -1445,8 +1734,18 @@ const executeRealTradeOrder = async (raw: RealTradeOrderRequest) => {
     postedAt,
     detectToOrderMs,
     attemptCount,
+    orderKind,
+    orderType,
+    openOrderId,
+    cancelledAt,
     rawResponse: scriptPayload.response ?? null,
-    script: scriptPayload,
+    orderStateResponse,
+    cancelResponse,
+    script: {
+      place: scriptPayload,
+      get: orderStateResponse ? { response: orderStateResponse } : null,
+      cancel: cancelResponse ? { response: cancelResponse } : null,
+    },
   };
 };
 
@@ -1466,7 +1765,11 @@ const toMonitorRequestPayload = (payload: {
   side?: string;
   price?: number;
   size?: number;
+  tradeUsd?: number;
   slippageCents?: number;
+  orderKind?: string;
+  orderType?: string;
+  quantityKind?: string;
 }) => ({
   marketSlug: payload.marketSlug ?? null,
   market: payload.market ?? null,
@@ -1475,7 +1778,11 @@ const toMonitorRequestPayload = (payload: {
   side: payload.side ?? null,
   price: payload.price ?? null,
   size: payload.size ?? null,
+  tradeUsd: payload.tradeUsd ?? null,
   slippageCents: payload.slippageCents ?? null,
+  orderKind: payload.orderKind ?? null,
+  orderType: payload.orderType ?? null,
+  quantityKind: payload.quantityKind ?? null,
 });
 
 const appendBlockedOrderMonitor = (
@@ -1507,7 +1814,9 @@ const appendBlockedOrderMonitor = (
     side: typeof event.side === "string" ? event.side : null,
     price: toFloat(event.price),
     size: toFloat(event.size),
+    value_usd: toFloat(event.value_usd),
     status: "blocked",
+    final_status: "blocked",
     error: reason,
     detected_at: detectedAt,
     order_posted_at: postedAt,
@@ -1699,15 +2008,23 @@ const getAllOrderHistory = (limit: number, walletFilter?: string) => {
 
 const getOrderStats = (rows: TrackerMonitorRecord[]) => {
   const total = rows.length;
-  const applied = rows.filter((row) => row.status === "matched" || row.status === "live").length;
-  const unapplied = rows.filter((row) => row.status === "error" || row.status === "blocked").length;
-  const pending = Math.max(0, total - applied - unapplied);
-  const denominator = applied + unapplied;
-  const successRate = denominator > 0 ? Number(((applied / denominator) * 100).toFixed(2)) : 0;
+  const matched = rows.filter((row) => row.status === "matched").length;
+  const open = rows.filter((row) => row.status === "live_open" || row.status === "live").length;
+  const cancelled = rows.filter((row) => row.status === "cancelled_after_timeout").length;
+  const failed = rows.filter((row) => row.status === "error" || row.status === "blocked").length;
+  const applied = matched;
+  const unapplied = cancelled + failed;
+  const pending = open;
+  const denominator = matched + cancelled + failed;
+  const successRate = denominator > 0 ? Number(((matched / denominator) * 100).toFixed(2)) : 0;
 
   return {
     generatedAt: utcNowIso(),
     total,
+    matched,
+    open,
+    cancelled,
+    failed,
     applied,
     unapplied,
     pending,
@@ -1803,6 +2120,8 @@ const appendOrderMonitor = (args: {
   webhookReceivedAt?: string | null;
   decodedAt?: string | null;
 }) => {
+  const responsePayload = args.responsePayload;
+  const requestPayload = args.requestPayload;
   const row: TrackerMonitorRecord = {
     id: args.requestId,
     kind: "order",
@@ -1817,12 +2136,31 @@ const appendOrderMonitor = (args: {
     side: args.event.side ?? null,
     price: toFloat(args.event.price),
     size: toFloat(args.event.size),
+    value_usd: toFloat(args.event.value_usd),
     status: args.status,
+    final_status: typeof responsePayload.finalStatus === "string" ? responsePayload.finalStatus : args.status,
     error: args.error,
     detected_at: args.detectedAt,
     order_posted_at: args.postedAt,
     detect_to_order_ms: args.detectToOrderMs,
     attempt_count: args.attemptCount,
+    order_kind: typeof responsePayload.orderKind === "string"
+      ? responsePayload.orderKind
+      : requestPayload && typeof requestPayload.orderKind === "string"
+        ? requestPayload.orderKind
+        : null,
+    order_type: typeof responsePayload.orderType === "string"
+      ? responsePayload.orderType
+      : requestPayload && typeof requestPayload.orderType === "string"
+        ? requestPayload.orderType
+        : null,
+    quantity_kind: typeof responsePayload.quantityKind === "string"
+      ? responsePayload.quantityKind
+      : requestPayload && typeof requestPayload.quantityKind === "string"
+        ? requestPayload.quantityKind
+        : null,
+    open_order_id: typeof responsePayload.openOrderId === "string" ? responsePayload.openOrderId : null,
+    cancelled_at: typeof responsePayload.cancelledAt === "string" ? responsePayload.cancelledAt : null,
     webhook_received_at: args.webhookReceivedAt ?? null,
     decoded_at: args.decodedAt ?? args.event.decoded_at ?? null,
     source_stage: args.event.source_stage ?? (args.source === "poll" ? "poll" : args.source === "webhook" ? "webhook" : "mined"),
@@ -1830,8 +2168,8 @@ const appendOrderMonitor = (args: {
     mined_seen_at: args.event.mined_seen_at ?? null,
     reconcile_status: args.event.reconcile_status ?? null,
     request_id: args.requestId,
-    request_payload: args.requestPayload,
-    response_payload: args.responsePayload,
+    request_payload: requestPayload,
+    response_payload: responsePayload,
   };
   trackerRuntime.appendMonitor(args.wallet, [row]);
 };
@@ -1879,6 +2217,14 @@ const processSessionEvent = async (
   }
 
   if (!isEventInConfiguredRanges(price, size, session.config)) {
+    const rangeDebug = {
+      eventCent: Number((price * 100).toFixed(4)),
+      eventSize: Number(size.toFixed(6)),
+      centRangeMin: session.config.centRangeMin,
+      centRangeMax: session.config.centRangeMax,
+      shareRangeMin: session.config.shareRangeMin,
+      shareRangeMax: session.config.shareRangeMax,
+    };
     appendOrderMonitor({
       wallet: session.walletAddress,
       source,
@@ -1887,7 +2233,7 @@ const processSessionEvent = async (
       status: "blocked",
       error: "Event aralık filtrelerine uymadı",
       requestPayload: null,
-      responsePayload: { ok: false, status: "blocked", error: "range_filter" },
+      responsePayload: { ok: false, status: "blocked", error: "range_filter", details: rangeDebug },
       detectedAt: normalizeIsoTimestamp(event.seen_at_utc),
       postedAt: utcNowIso(),
       detectToOrderMs: null,
@@ -1967,6 +2313,9 @@ const processSessionEvent = async (
   const marketSlug = (event.market_slug ?? "").trim();
   const outcome = (event.outcome ?? "").trim();
   const useSlippage = session.config.useSlippage !== false;
+  const requestOrderKind: RealTradeOrderKind = useSlippage ? "limit" : "market-like";
+  const requestOrderType: RealTradeOrderType = useSlippage ? "GTC" : "FAK";
+  const requestQuantityKind = side === "BUY" && !useSlippage ? "usd" : "shares";
 
   if (!assetId && (!useSlippage || !marketSlug || !outcome)) {
     appendOrderMonitor({
@@ -1989,20 +2338,20 @@ const processSessionEvent = async (
   }
 
   const requestId = crypto.randomUUID();
-  const estimatedSize = session.config.mode === "notional"
-    ? size
-    : Number((tradeUsd / price).toFixed(6));
-  const requestPayload: Record<string, unknown> = {
-    marketSlug: marketSlug || null,
-    market: event.market ?? null,
-    outcome: outcome || null,
-    assetId: assetId || null,
+  const requestPayload: Record<string, unknown> = toMonitorRequestPayload({
+    marketSlug: marketSlug || undefined,
+    market: event.market ?? undefined,
+    outcome: outcome || undefined,
+    assetId: assetId || undefined,
     side,
     price,
-    size: estimatedSize > 0 ? estimatedSize : size,
+    size,
+    tradeUsd,
     slippageCents: useSlippage ? session.config.slippageCents : 0,
-    useSlippage,
-  };
+    orderKind: requestOrderKind,
+    orderType: requestOrderType,
+    quantityKind: requestQuantityKind,
+  });
 
   const detectedAt = normalizeIsoTimestamp(event.seen_at_utc);
   session.status = "syncing";
@@ -2015,7 +2364,8 @@ const processSessionEvent = async (
       assetId: assetId || undefined,
       side,
       price,
-      size: estimatedSize > 0 ? estimatedSize : size,
+      size,
+      tradeUsd,
       slippageCents: useSlippage ? session.config.slippageCents : 0,
       walletAddress: session.walletAddress,
       detectedAt,
@@ -2045,7 +2395,7 @@ const processSessionEvent = async (
       `[order] wallet=${session.walletAddress} status=${status} latency_ms=${typeof response.detectToOrderMs === "number" ? response.detectToOrderMs : "na"} source=${source} market=${marketSlug || event.market || "-"}`,
     );
 
-    if (status === "matched" || status === "live") {
+    if (status === "matched") {
       session.copiedCount += 1;
       if (session.config.mode === "buy-wait") {
         const marketKey = resolveMarketKey(event);
@@ -2638,14 +2988,17 @@ const createPolymarketTrackerPlugin = (): Plugin => ({
             : utcNowIso();
 
           const monitorRequestPayload: Record<string, unknown> = {
-            marketSlug: parsed.marketSlug ?? null,
-            market: parsed.market ?? null,
-            outcome: parsed.outcome ?? null,
-            assetId: parsed.assetId ?? null,
-            side: parsed.side ?? null,
-            price: parsed.price ?? null,
-            size: parsed.size ?? null,
-            slippageCents: parsed.slippageCents ?? null,
+            ...toMonitorRequestPayload({
+              marketSlug: parsed.marketSlug ?? undefined,
+              market: parsed.market ?? undefined,
+              outcome: parsed.outcome ?? undefined,
+              assetId: parsed.assetId ?? undefined,
+              side: parsed.side ?? undefined,
+              price: parsed.price ?? undefined,
+              size: parsed.size ?? undefined,
+              tradeUsd: parsed.tradeUsd ?? undefined,
+              slippageCents: parsed.slippageCents ?? undefined,
+            }),
           };
 
           try {
@@ -2670,14 +3023,21 @@ const createPolymarketTrackerPlugin = (): Plugin => ({
                 outcome: typeof responsePayload.outcome === "string" ? responsePayload.outcome : null,
                 asset_id: typeof responsePayload.assetId === "string" ? responsePayload.assetId : null,
                 side: typeof responsePayload.side === "string" ? responsePayload.side : null,
-                price: typeof responsePayload.limitPrice === "number" ? responsePayload.limitPrice : null,
-                size: typeof responsePayload.size === "number" ? responsePayload.size : null,
+                price: typeof responsePayload.requestedPrice === "number" ? responsePayload.requestedPrice : toFloat(parsed.price),
+                size: typeof responsePayload.size === "number" ? responsePayload.size : toFloat(parsed.size),
+                value_usd: typeof responsePayload.tradeUsd === "number" ? responsePayload.tradeUsd : toFloat(parsed.tradeUsd),
                 status: typeof responsePayload.status === "string" ? responsePayload.status : "error",
-                error: null,
+                final_status: typeof responsePayload.finalStatus === "string" ? responsePayload.finalStatus : (typeof responsePayload.status === "string" ? responsePayload.status : "error"),
+                error: typeof responsePayload.error === "string" ? responsePayload.error : null,
                 detected_at: detectedAt,
                 order_posted_at: typeof responsePayload.postedAt === "string" ? responsePayload.postedAt : utcNowIso(),
                 detect_to_order_ms: typeof responsePayload.detectToOrderMs === "number" ? responsePayload.detectToOrderMs : null,
                 attempt_count: typeof responsePayload.attemptCount === "number" ? responsePayload.attemptCount : null,
+                order_kind: typeof responsePayload.orderKind === "string" ? responsePayload.orderKind : null,
+                order_type: typeof responsePayload.orderType === "string" ? responsePayload.orderType : null,
+                quantity_kind: typeof responsePayload.quantityKind === "string" ? responsePayload.quantityKind : null,
+                open_order_id: typeof responsePayload.openOrderId === "string" ? responsePayload.openOrderId : null,
+                cancelled_at: typeof responsePayload.cancelledAt === "string" ? responsePayload.cancelledAt : null,
                 source_stage: source === "poll" ? "poll" : source === "webhook" ? "webhook" : source === "ui" ? null : "mined",
                 pending_seen_at: null,
                 mined_seen_at: null,
@@ -2717,7 +3077,9 @@ const createPolymarketTrackerPlugin = (): Plugin => ({
                 side: parsed.side ?? null,
                 price: toFloat(parsed.price),
                 size: toFloat(parsed.size),
+                value_usd: toFloat(parsed.tradeUsd),
                 status: "error",
+                final_status: "error",
                 error: errorPayload.error,
                 detected_at: detectedAt,
                 order_posted_at: errorPayload.postedAt,
@@ -2725,6 +3087,11 @@ const createPolymarketTrackerPlugin = (): Plugin => ({
                   ? Math.max(0, postedTs - detectTs)
                   : null,
                 attempt_count: null,
+                order_kind: null,
+                order_type: null,
+                quantity_kind: null,
+                open_order_id: null,
+                cancelled_at: null,
                 source_stage: source === "poll" ? "poll" : source === "webhook" ? "webhook" : source === "ui" ? null : "mined",
                 pending_seen_at: null,
                 mined_seen_at: null,

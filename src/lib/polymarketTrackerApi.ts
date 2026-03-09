@@ -101,6 +101,7 @@ export type RealTradeOrderRequest = {
   side: 'BUY' | 'SELL';
   price: number;
   size: number;
+  tradeUsd?: number;
   slippageCents: number;
   walletAddress?: string;
   detectedAt?: string;
@@ -111,24 +112,37 @@ export type RealTradeOrderRequest = {
 
 export type RealTradeOrderResult = {
   ok: boolean;
-  resultIcon: '✅' | '☑️' | '❌';
-  status: 'matched' | 'live' | 'error' | string;
+  resultIcon: '✅' | '☑️' | '⏳' | '❌';
+  status: 'matched' | 'live' | 'live_open' | 'cancelled_after_timeout' | 'blocked' | 'error' | string;
+  finalStatus?: string;
   error?: string;
   marketSlug?: string;
   outcome?: string;
   side?: 'BUY' | 'SELL';
   assetId?: string;
   requestedPrice?: number;
-  limitPrice?: number;
-  size?: number;
+  marketQuotePrice?: number | null;
+  limitPrice?: number | null;
+  size?: number | null;
+  submittedSize?: number | null;
+  sourceSize?: number | null;
+  sourceValueUsd?: number | null;
+  tradeUsd?: number | null;
   slippageCents?: number;
+  quantityKind?: 'usd' | 'shares' | string;
   detectedAt?: string;
   postedAt?: string;
   detectToOrderMs?: number | null;
   attemptCount?: number | null;
   source?: 'ws' | 'poll' | 'ui' | 'webhook' | string;
   requestId?: string;
+  orderKind?: 'limit' | 'market-like' | string;
+  orderType?: 'GTC' | 'FAK' | 'FOK' | 'GTD' | string;
+  openOrderId?: string | null;
+  cancelledAt?: string | null;
   rawResponse?: Record<string, unknown> | null;
+  orderStateResponse?: Record<string, unknown> | null;
+  cancelResponse?: Record<string, unknown> | null;
 };
 
 export type TrackerMonitorRecord = {
@@ -145,12 +159,19 @@ export type TrackerMonitorRecord = {
   side?: string | null;
   price?: number | null;
   size?: number | null;
+  value_usd?: number | null;
   status: string;
+  final_status?: string | null;
   error?: string | null;
   detected_at?: string | null;
   order_posted_at?: string | null;
   detect_to_order_ms?: number | null;
   attempt_count?: number | null;
+  order_kind?: string | null;
+  order_type?: string | null;
+  quantity_kind?: string | null;
+  open_order_id?: string | null;
+  cancelled_at?: string | null;
   webhook_received_at?: string | null;
   decoded_at?: string | null;
   request_id?: string | null;
@@ -252,6 +273,10 @@ export type BackendCopySession = {
 export type OrderStatsResponse = {
   generatedAt: string;
   total: number;
+  matched: number;
+  open: number;
+  cancelled: number;
+  failed: number;
   applied: number;
   unapplied: number;
   pending: number;
