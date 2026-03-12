@@ -1,5 +1,10 @@
 import React, { createContext, useContext, useState, useCallback, useEffect, ReactNode, useRef } from 'react';
-import { startWalletTracking } from '@/lib/polymarketTrackerApi';
+import {
+  createExecutionWallet,
+  listExecutionWallets,
+  startWalletTracking,
+  type ExecutionWalletSummary,
+} from '@/lib/polymarketTrackerApi';
 
 export interface TrackedAddress {
   id: string;
@@ -74,10 +79,16 @@ interface DashboardContextType {
   categories: string[];
   paperTrades: PaperTrade[];
   paperBudget: PaperBudget;
+  executionWallets: ExecutionWalletSummary[];
+  selectedExecutionWalletId: string | null;
+  selectedExecutionWallet: ExecutionWalletSummary | null;
   addAddress: (address: string, category: string, profile?: Partial<TrackedAddress>) => void;
   updateAddressNote: (id: string, note: string) => void;
   removeAddress: (id: string) => void;
   addCategory: (category: string) => void;
+  selectExecutionWallet: (walletId: string | null) => void;
+  refreshExecutionWallets: () => Promise<void>;
+  addExecutionWallet: (payload: { nickName: string; privateKey: string; funderAddress: string }) => Promise<ExecutionWalletSummary>;
   addToPaperTrade: (addressId: string) => void;
   setPaperBudget: (config: { mode: 'unlimited' | 'limited'; type: 'daily' | 'total'; amount: number }) => void;
   startPaperTrade: (addressId: string, input: StartPaperTradeInput) => { ok: boolean; reason?: string };
@@ -88,6 +99,7 @@ const DashboardContext = createContext<DashboardContextType | undefined>(undefin
 
 const DEFAULT_CATEGORIES = ['Weather', 'Elon Musk', 'Crypto', 'Politic', 'Sport'];
 const DASHBOARD_STORAGE_KEY = 'pm-dashboard-state-v1';
+const EXECUTION_WALLET_STORAGE_KEY = 'pm-selected-execution-wallet-v1';
 
 type DashboardPersistedState = {
   addresses: Array<Omit<TrackedAddress, 'addedAt'> & { addedAt: string }>;
@@ -147,6 +159,12 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
     return merged;
   });
   const [paperTrades, setPaperTrades] = useState<PaperTrade[]>([]);
+  const [executionWallets, setExecutionWallets] = useState<ExecutionWalletSummary[]>([]);
+  const [selectedExecutionWalletId, setSelectedExecutionWalletId] = useState<string | null>(() => {
+    if (typeof window === 'undefined') return null;
+    const raw = window.localStorage.getItem(EXECUTION_WALLET_STORAGE_KEY);
+    return raw?.trim() || null;
+  });
   const startedTrackerAddressesRef = useRef<Set<string>>(new Set());
   const [paperBudget, setPaperBudgetState] = useState<PaperBudget>({
     mode: 'unlimited',
@@ -189,6 +207,43 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
   const addCategory = useCallback((category: string) => {
     setCategories(prev => prev.includes(category) ? prev : [...prev, category]);
   }, []);
+
+  const selectExecutionWallet = useCallback((walletId: string | null) => {
+    setSelectedExecutionWalletId(walletId);
+    if (typeof window !== 'undefined') {
+      if (walletId) {
+        window.localStorage.setItem(EXECUTION_WALLET_STORAGE_KEY, walletId);
+      } else {
+        window.localStorage.removeItem(EXECUTION_WALLET_STORAGE_KEY);
+      }
+    }
+  }, []);
+
+  const refreshExecutionWallets = useCallback(async () => {
+    const payload = await listExecutionWallets();
+    const wallets = Array.isArray(payload.wallets) ? payload.wallets : [];
+    setExecutionWallets(wallets);
+    setSelectedExecutionWalletId((current) => {
+      if (current && wallets.some((item) => item.id === current)) return current;
+      const fallback = wallets[0]?.id ?? null;
+      if (typeof window !== 'undefined') {
+        if (fallback) {
+          window.localStorage.setItem(EXECUTION_WALLET_STORAGE_KEY, fallback);
+        } else {
+          window.localStorage.removeItem(EXECUTION_WALLET_STORAGE_KEY);
+        }
+      }
+      return fallback;
+    });
+  }, []);
+
+  const addExecutionWallet = useCallback(async (payload: { nickName: string; privateKey: string; funderAddress: string }) => {
+    const response = await createExecutionWallet(payload);
+    const wallets = Array.isArray(response.wallets) ? response.wallets : [];
+    setExecutionWallets(wallets);
+    selectExecutionWallet(response.wallet.id);
+    return response.wallet;
+  }, [selectExecutionWallet]);
 
   const addToPaperTrade = useCallback((_addressId: string) => {
     // Already handled - addresses show in paper trade tab
@@ -292,6 +347,12 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
   }, []);
 
   useEffect(() => {
+    void refreshExecutionWallets();
+  }, [refreshExecutionWallets]);
+
+  const selectedExecutionWallet = executionWallets.find((item) => item.id === selectedExecutionWalletId) ?? null;
+
+  useEffect(() => {
     if (typeof window === 'undefined') return;
 
     const payload: DashboardPersistedState = {
@@ -332,7 +393,9 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
   return (
     <DashboardContext.Provider value={{
       addresses, categories, paperTrades, paperBudget,
+      executionWallets, selectedExecutionWalletId, selectedExecutionWallet,
       addAddress, updateAddressNote, removeAddress, addCategory, addToPaperTrade,
+      selectExecutionWallet, refreshExecutionWallets, addExecutionWallet,
       setPaperBudget, startPaperTrade, closePaperTrade,
     }}>
       {children}

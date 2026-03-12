@@ -98,6 +98,7 @@ export type RealTradeOrderRequest = {
   market?: string;
   outcome?: string;
   assetId?: string;
+  executionWalletId?: string;
   side: 'BUY' | 'SELL';
   price: number;
   size: number;
@@ -264,6 +265,8 @@ export type BackendCopySession = {
   walletAddress: string;
   strategy: string;
   config?: CopySessionConfigPayload;
+  executionWalletId?: string | null;
+  executionWalletNickname?: string | null;
   status: 'running' | 'syncing' | 'idle';
   startedAt: string;
   processedCount: number;
@@ -279,6 +282,16 @@ export type BackendCopySession = {
     side: string;
     status: string;
   }>;
+};
+
+export type ExecutionWalletSummary = {
+  id: string;
+  nickName: string;
+  funderAddress: string;
+  hasPrivateKey: boolean;
+  source: 'managed' | 'legacy';
+  createdAt: string;
+  updatedAt: string;
 };
 
 export type OrderStatsResponse = {
@@ -451,10 +464,37 @@ export async function updateAutoOrderControl(action: 'arm' | 'disarm', minutes?:
   return response.json() as Promise<AutoOrderControlStatus>;
 }
 
+export async function listExecutionWallets(): Promise<{ wallets: ExecutionWalletSummary[] }> {
+  const response = await fetch('/api/tracker/execution-wallets', { cache: 'no-store' });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(text || 'Execution wallet listesi alınamadı');
+  }
+  return response.json() as Promise<{ wallets: ExecutionWalletSummary[] }>;
+}
+
+export async function createExecutionWallet(payload: {
+  nickName: string;
+  privateKey: string;
+  funderAddress: string;
+}): Promise<{ ok: true; wallet: ExecutionWalletSummary; wallets: ExecutionWalletSummary[] }> {
+  const response = await fetch('/api/tracker/execution-wallets', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(text || 'Execution wallet eklenemedi');
+  }
+  return response.json() as Promise<{ ok: true; wallet: ExecutionWalletSummary; wallets: ExecutionWalletSummary[] }>;
+}
+
 export async function startCopySession(payload: {
   addressId: string;
   walletAddress: string;
   strategy: string;
+  executionWalletId: string;
   config: CopySessionConfigPayload;
 }) {
   const response = await fetch('/api/tracker/copy-session/start', {

@@ -189,6 +189,8 @@ interface CopySessionState {
   strategy: string;
   startedAt: Date;
   status: 'idle' | 'running' | 'syncing';
+  executionWalletId?: string | null;
+  executionWalletNickname?: string | null;
   lastEventKey?: string;
   marketBuyCounts?: Record<string, number>;
 }
@@ -633,7 +635,14 @@ export default function PaperTradeTab({
   mode?: 'paper' | 'real';
 }) {
   const isRealMode = mode === 'real';
-  const { addresses, paperTrades, startPaperTrade, paperBudget, setPaperBudget } = useDashboard();
+  const {
+    addresses,
+    paperTrades,
+    startPaperTrade,
+    paperBudget,
+    setPaperBudget,
+    selectedExecutionWallet,
+  } = useDashboard();
   const [setupId, setSetupId] = useState<string | null>(preselectedId || null);
   const [setupStrategy, setSetupStrategy] = useState(defaultConfig.strategy);
   const [setupStrategyDraft, setSetupStrategyDraft] = useState(defaultConfig.strategy);
@@ -786,6 +795,8 @@ export default function PaperTradeTab({
             addressId: item.addressId,
             strategy: item.strategy,
             startedAt: new Date(item.startedAt),
+            executionWalletId: item.executionWalletId ?? null,
+            executionWalletNickname: item.executionWalletNickname ?? null,
             status: item.status === 'syncing' ? 'syncing' : (item.status === 'running' ? 'running' : 'idle'),
             marketBuyCounts: item.marketBuyCounts || {},
           };
@@ -1489,6 +1500,9 @@ export default function PaperTradeTab({
 
   const handleStart = async () => {
     if (!setupId) return toast.error('Önce bir cüzdan seçin');
+    if (isRealMode && !selectedExecutionWallet) {
+      return toast.error('Önce üst menüden bir execution wallet seçin veya ekleyin.');
+    }
 
     const nextBudget = resolveBudgetDraft();
     if (currentConfig.mode === 'proportional' && nextBudget.mode !== 'limited') {
@@ -1539,6 +1553,7 @@ export default function PaperTradeTab({
           addressId: setupId,
           walletAddress: selectedAddress.address,
           strategy: strategyName,
+          executionWalletId: selectedExecutionWallet!.id,
           config: {
             mode: latestConfig.mode,
             sourceTradeUsd: toPositiveNumber(latestConfig.sourceTradeUsd),
@@ -1566,6 +1581,8 @@ export default function PaperTradeTab({
             addressId: setupId,
             strategy: strategyName,
             startedAt: new Date(),
+            executionWalletId: selectedExecutionWallet?.id ?? null,
+            executionWalletNickname: selectedExecutionWallet?.nickName ?? null,
             status: 'running',
             marketBuyCounts: {},
           },
@@ -1592,6 +1609,8 @@ export default function PaperTradeTab({
           addressId: setupId,
           strategy: strategyName,
           startedAt: new Date(),
+          executionWalletId: selectedExecutionWallet?.id ?? null,
+          executionWalletNickname: selectedExecutionWallet?.nickName ?? null,
           status: 'running',
           lastEventKey: latestEventKey,
           marketBuyCounts: {},
@@ -1720,6 +1739,22 @@ export default function PaperTradeTab({
           </p>
         </div>
       </div>
+
+      {isRealMode && (
+        <div className="glass-card p-4 mb-6 border border-primary/20">
+          <p className="text-xs text-muted-foreground">
+            Aktif execution wallet:
+            <span className="ml-2 font-semibold text-foreground">
+              {selectedExecutionWallet?.nickName || 'Seçilmedi'}
+            </span>
+            {selectedExecutionWallet?.funderAddress && (
+              <span className="ml-2 font-mono text-[10px] text-muted-foreground">
+                {selectedExecutionWallet.funderAddress}
+              </span>
+            )}
+          </p>
+        </div>
+      )}
 
       {view === 'paper' && (
         <>
@@ -2009,6 +2044,9 @@ export default function PaperTradeTab({
                         <div>
                           <p className="text-xs font-semibold text-foreground">{walletName} <span className="text-muted-foreground">• {strategy}</span></p>
                           <p className="font-mono text-[10px] text-muted-foreground truncate">{walletAddress || addressId}</p>
+                          {isRealMode && session.executionWalletNickname && (
+                            <p className="mt-1 text-[11px] text-primary">Gerçek Wallet: {session.executionWalletNickname}</p>
+                          )}
                           <p className="mt-1 text-[11px] text-muted-foreground">{configDescription}</p>
                           {copySessionErrors[sessionKey] && (
                             <p className="mt-2 text-[11px] text-destructive">Hata: {copySessionErrors[sessionKey]}</p>

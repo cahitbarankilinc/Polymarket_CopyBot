@@ -66,6 +66,8 @@ const REAL_ORDER_TIMEOUT_MS = Number(process.env.POLYMARKET_REAL_ORDER_TIMEOUT_M
 const LIVE_ORDER_CANCEL_AFTER_MS = Math.max(1000, Number(process.env.POLYMARKET_LIVE_CANCEL_AFTER_MS ?? 5000));
 const POLYMARKET_PRIVATE_KEY = (process.env.POLYMARKET_PRIVATE_KEY ?? "").trim();
 const POLYMARKET_FUNDER_ADDRESS = (process.env.POLYMARKET_FUNDER_ADDRESS ?? "").trim();
+const POLYMARKET_EXECUTION_WALLETS_ENV_KEY = "POLYMARKET_EXECUTION_WALLETS_JSON";
+const LEGACY_EXECUTION_WALLET_ID = "__legacy_default__";
 const DEFAULT_REAL_ORDER_SLIPPAGE_CENTS = Math.max(0, Number(process.env.POLYMARKET_DEFAULT_SLIPPAGE_CENTS ?? 5));
 const AUTO_REAL_ORDER_ENABLED = (process.env.POLYMARKET_AUTO_ORDER_ENABLED ?? "0").trim() === "1";
 const ORDER_ARM_DEFAULT_MINUTES = Math.max(1, Number(process.env.POLYMARKET_ARM_DEFAULT_MINUTES ?? 10));
@@ -94,6 +96,150 @@ Asla:
 - Gerekçe yazma; sadece net özet.
 
 Dil: Türkçe. Ton: kısa, temiz, doğrudan.`;
+
+const parseStoredExecutionWallet = (value: unknown): StoredExecutionWallet | null => {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  const id = typeof record.id === "string" ? record.id.trim() : "";
+  const nickName = typeof record.nickName === "string" ? record.nickName.trim() : "";
+  const privateKey = typeof record.privateKey === "string" ? record.privateKey.trim() : "";
+  const funderAddress = typeof record.funderAddress === "string" ? record.funderAddress.trim() : "";
+  const createdAt = typeof record.createdAt === "string" && record.createdAt.trim()
+    ? record.createdAt.trim()
+    : new Date().toISOString();
+  const updatedAt = typeof record.updatedAt === "string" && record.updatedAt.trim()
+    ? record.updatedAt.trim()
+    : createdAt;
+  if (!id || !nickName || !privateKey || !funderAddress) return null;
+  return {
+    id,
+    nickName,
+    privateKey,
+    funderAddress,
+    createdAt,
+    updatedAt,
+  };
+};
+
+const readManagedExecutionWalletsFromEnv = (): StoredExecutionWallet[] => {
+  const raw = (process.env[POLYMARKET_EXECUTION_WALLETS_ENV_KEY] ?? "").trim();
+  if (!raw) return [];
+
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .map(parseStoredExecutionWallet)
+      .filter((item): item is StoredExecutionWallet => item !== null);
+  } catch {
+    return [];
+  }
+};
+
+let managedExecutionWallets: StoredExecutionWallet[] = readManagedExecutionWalletsFromEnv();
+
+const writeEnvValue = (key: string, value: string) => {
+  const nextLine = `${key}=${value}`;
+  const lines = fs.existsSync(localEnvPath)
+    ? fs.readFileSync(localEnvPath, "utf-8").split(/\r?\n/)
+    : [];
+  let replaced = false;
+  const nextLines = lines.map((line) => {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) return line;
+    const eqIndex = line.indexOf("=");
+    if (eqIndex <= 0) return line;
+    const currentKey = line.slice(0, eqIndex).trim();
+    if (currentKey !== key) return line;
+    replaced = true;
+    return nextLine;
+  });
+
+  if (!replaced) {
+    if (nextLines.length > 0 && nextLines[nextLines.length - 1] !== "") nextLines.push("");
+    nextLines.push(nextLine);
+  }
+
+  fs.writeFileSync(localEnvPath, `${nextLines.join("\n").replace(/\n*$/, "")}\n`, "utf-8");
+  process.env[key] = value;
+};
+
+const persistManagedExecutionWallets = () => {
+  managedExecutionWallets = [...managedExecutionWallets]
+    .sort((a, b) => a.nickName.localeCompare(b.nickName, "tr"));
+  writeEnvValue(POLYMARKET_EXECUTION_WALLETS_ENV_KEY, JSON.stringify(managedExecutionWallets));
+};
+
+const buildLegacyExecutionWallet = (): ExecutionWalletRecord | null => {
+  if (!POLYMARKET_PRIVATE_KEY || !POLYMARKET_FUNDER_ADDRESS) return null;
+  return {
+    id: LEGACY_EXECUTION_WALLET_ID,
+    nickName: "Default Wallet",
+    privateKey: POLYMARKET_PRIVATE_KEY,
+    funderAddress: POLYMARKET_FUNDER_ADDRESS,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    source: "legacy",
+  };
+};
+
+const listExecutionWalletRecords = (): ExecutionWalletRecord[] => {
+  const legacy = buildLegacyExecutionWallet();
+  const managed = managedExecutionWallets.map((item) => ({ ...item, source: "managed" as const }));
+  return legacy ? [legacy, ...managed] : managed;
+};
+
+const toExecutionWalletSummary = (wallet: ExecutionWalletRecord): ExecutionWalletSummary => ({
+  id: wallet.id,
+  nickName: wallet.nickName,
+  funderAddress: wallet.funderAddress,
+  hasPrivateKey: wallet.privateKey.length > 0,
+  source: wallet.source,
+  createdAt: wallet.createdAt,
+  updatedAt: wallet.updatedAt,
+});
+
+const listExecutionWalletSummaries = (): ExecutionWalletSummary[] => (
+  listExecutionWalletRecords().map(toExecutionWalletSummary)
+);
+
+const resolveExecutionWalletRecord = (walletId?: string | null): ExecutionWalletRecord | null => {
+  const normalizedId = typeof walletId === "string" ? walletId.trim() : "";
+  const wallets = listExecutionWalletRecords();
+  if (normalizedId) return wallets.find((item) => item.id === normalizedId) ?? null;
+  return wallets[0] ?? null;
+};
+
+const createManagedExecutionWallet = (input: {
+  nickName: string;
+  privateKey: string;
+  funderAddress: string;
+}): ExecutionWalletRecord => {
+  const nickName = input.nickName.trim();
+  const privateKey = input.privateKey.trim();
+  const funderAddress = input.funderAddress.trim();
+  if (!nickName || !privateKey || !funderAddress) {
+    throw new Error("Nick_Name, POLYMARKET_PRIVATE_KEY ve POLYMARKET_FUNDER_ADDRESS zorunludur.");
+  }
+
+  const existingName = managedExecutionWallets.find((item) => item.nickName.toLowerCase() === nickName.toLowerCase());
+  if (existingName) {
+    throw new Error("Aynı Nick_Name ile kayıtlı wallet zaten var.");
+  }
+
+  const now = new Date().toISOString();
+  const wallet: StoredExecutionWallet = {
+    id: crypto.randomUUID(),
+    nickName,
+    privateKey,
+    funderAddress,
+    createdAt: now,
+    updatedAt: now,
+  };
+  managedExecutionWallets.push(wallet);
+  persistManagedExecutionWallets();
+  return { ...wallet, source: "managed" };
+};
 
 type RawEvent = Record<string, unknown>;
 
@@ -166,6 +312,7 @@ type RealTradeOrderRequest = {
   marketSlug?: string;
   market?: string;
   outcome?: string;
+  executionWalletId?: string;
   side?: string;
   price?: number;
   size?: number;
@@ -208,6 +355,8 @@ type BackendCopySession = {
   walletAddress: string;
   strategy: string;
   config: BackendCopySessionConfig;
+  executionWalletId: string | null;
+  executionWalletNickname: string | null;
   status: "running" | "syncing" | "idle";
   startedAt: string;
   marketBuyCounts: Record<string, number>;
@@ -243,6 +392,29 @@ type RealTradeScriptPayload = {
   orderId?: string | null;
   orderKind?: RealTradeOrderKind;
   orderType?: RealTradeOrderType;
+};
+
+type StoredExecutionWallet = {
+  id: string;
+  nickName: string;
+  privateKey: string;
+  funderAddress: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type ExecutionWalletRecord = StoredExecutionWallet & {
+  source: "managed" | "legacy";
+};
+
+type ExecutionWalletSummary = {
+  id: string;
+  nickName: string;
+  funderAddress: string;
+  hasPrivateKey: boolean;
+  source: "managed" | "legacy";
+  createdAt: string;
+  updatedAt: string;
 };
 
 const runtimes = new Map<string, TrackerRuntime>();
@@ -1080,6 +1252,8 @@ const persistCopySessions = () => {
         walletAddress: session.walletAddress,
         strategy: session.strategy,
         config: session.config,
+        executionWalletId: session.executionWalletId,
+        executionWalletNickname: session.executionWalletNickname,
         status: session.status,
         startedAt: session.startedAt,
         marketBuyCounts: session.marketBuyCounts,
@@ -1116,6 +1290,10 @@ const restoreCopySessions = () => {
       const walletAddress = trackerRuntime.normalizeWallet(item.walletAddress ?? "");
       const strategy = normalizeStrategyName(typeof item.strategy === "string" ? item.strategy : undefined);
       if (!addressId || !walletAddress) continue;
+      const executionWalletId = typeof item.executionWalletId === "string" && item.executionWalletId.trim()
+        ? item.executionWalletId.trim()
+        : null;
+      const executionWallet = resolveExecutionWalletRecord(executionWalletId);
 
       const processedQueue = Array.isArray(item.processedQueue)
         ? item.processedQueue.filter((value): value is string => typeof value === "string" && value.trim().length > 0).slice(-MAX_SESSION_EVENT_KEYS)
@@ -1128,6 +1306,8 @@ const restoreCopySessions = () => {
         walletAddress,
         strategy,
         config: parseCopySessionConfig((item.config && typeof item.config === "object") ? item.config as Record<string, unknown> : {}),
+        executionWalletId: executionWallet?.id ?? executionWalletId,
+        executionWalletNickname: executionWallet?.nickName ?? (typeof item.executionWalletNickname === "string" ? item.executionWalletNickname.trim() || null : null),
         status: item.status === "syncing" ? "syncing" : "running",
         startedAt: typeof item.startedAt === "string" && item.startedAt.trim() ? item.startedAt : utcNowIso(),
         marketBuyCounts: item.marketBuyCounts && typeof item.marketBuyCounts === "object"
@@ -1701,6 +1881,17 @@ const executeRealTradeOrder = async (raw: RealTradeOrderRequest) => {
     ? raw.requestId.trim()
     : crypto.randomUUID();
   const walletAddress = normalizeWallet(String(raw.walletAddress ?? ""));
+  const executionWalletId = typeof raw.executionWalletId === "string" ? raw.executionWalletId.trim() : "";
+  const executionWallet = resolveExecutionWalletRecord(executionWalletId);
+  if (!executionWallet) {
+    throw new Error("Execution wallet bulunamadı");
+  }
+  if (!executionWallet.privateKey) {
+    throw new Error("Seçili execution wallet private key içermiyor");
+  }
+  if (!executionWallet.funderAddress) {
+    throw new Error("Seçili execution wallet funder address içermiyor");
+  }
 
   const detectedAtCandidate = String(raw.detectedAt ?? "").trim();
   const detectedAt = detectedAtCandidate && !Number.isNaN(Date.parse(detectedAtCandidate))
@@ -1839,8 +2030,8 @@ const executeRealTradeOrder = async (raw: RealTradeOrderRequest) => {
       side,
       price: limitPrice ?? 0,
       size: submittedSize,
-      privateKey: POLYMARKET_PRIVATE_KEY || undefined,
-      funderAddress: POLYMARKET_FUNDER_ADDRESS || undefined,
+      privateKey: executionWallet.privateKey,
+      funderAddress: executionWallet.funderAddress,
       signatureType: 1,
       orderKind,
       orderType,
@@ -1885,8 +2076,8 @@ const executeRealTradeOrder = async (raw: RealTradeOrderRequest) => {
           side,
           price: limitPrice ?? 0,
           size: submittedSize,
-          privateKey: POLYMARKET_PRIVATE_KEY || undefined,
-          funderAddress: POLYMARKET_FUNDER_ADDRESS || undefined,
+          privateKey: executionWallet.privateKey,
+          funderAddress: executionWallet.funderAddress,
           signatureType: 1,
           orderKind,
           orderType,
@@ -1907,8 +2098,8 @@ const executeRealTradeOrder = async (raw: RealTradeOrderRequest) => {
             side,
             price: limitPrice ?? 0,
             size: submittedSize,
-            privateKey: POLYMARKET_PRIVATE_KEY || undefined,
-            funderAddress: POLYMARKET_FUNDER_ADDRESS || undefined,
+            privateKey: executionWallet.privateKey,
+            funderAddress: executionWallet.funderAddress,
             signatureType: 1,
             orderKind,
             orderType,
@@ -2220,6 +2411,8 @@ const listCopySessionsPayload = () => ({
     walletAddress: session.walletAddress,
     strategy: session.strategy,
     config: session.config,
+    executionWalletId: session.executionWalletId,
+    executionWalletNickname: session.executionWalletNickname,
     status: session.status,
     startedAt: session.startedAt,
     processedCount: session.processedCount,
@@ -2823,17 +3016,23 @@ const processSessionEvent = async (
     orderType: requestOrderType,
     quantityKind: requestQuantityKind,
   });
+  requestPayload.executionWalletId = session.executionWalletId ?? null;
+  requestPayload.executionWalletNickname = session.executionWalletNickname ?? null;
 
   const detectedAt = normalizeIsoTimestamp(event.seen_at_utc);
   session.status = "syncing";
   persistCopySessionsSafe();
 
   try {
+    if (!session.executionWalletId) {
+      throw new Error("Session için execution wallet atanmadı");
+    }
     const response = await enqueueOrderJob(session.walletAddress, async () => executeRealTradeOrder({
       marketSlug: marketSlug || undefined,
       market: event.market ?? undefined,
       outcome: outcome || undefined,
       assetId: assetId || undefined,
+      executionWalletId: session.executionWalletId,
       side,
       price,
       size,
@@ -3244,19 +3443,54 @@ const createPolymarketTrackerPlugin = (): Plugin => ({
           return;
         }
 
+        if (req.method === "GET" && req.url === "/api/tracker/execution-wallets") {
+          sendJson(200, { wallets: listExecutionWalletSummaries() });
+          return;
+        }
+
+        if (req.method === "POST" && req.url === "/api/tracker/execution-wallets") {
+          const parsed = await readJsonBody<{
+            nickName?: string;
+            privateKey?: string;
+            funderAddress?: string;
+          }>(req);
+
+          try {
+            const wallet = createManagedExecutionWallet({
+              nickName: typeof parsed.nickName === "string" ? parsed.nickName : "",
+              privateKey: typeof parsed.privateKey === "string" ? parsed.privateKey : "",
+              funderAddress: typeof parsed.funderAddress === "string" ? parsed.funderAddress : "",
+            });
+            sendJson(200, {
+              ok: true,
+              wallet: toExecutionWalletSummary(wallet),
+              wallets: listExecutionWalletSummaries(),
+            });
+          } catch (error) {
+            sendJson(400, { error: error instanceof Error ? error.message : "Wallet eklenemedi" });
+          }
+          return;
+        }
+
         if (req.method === "POST" && req.url === "/api/tracker/copy-session/start") {
           const parsed = await readJsonBody<{
             addressId?: string;
             walletAddress?: string;
             strategy?: string;
+            executionWalletId?: string;
             config?: Record<string, unknown>;
           }>(req);
 
           const addressId = typeof parsed.addressId === "string" ? parsed.addressId.trim() : "";
           const walletAddress = trackerRuntime.normalizeWallet(parsed.walletAddress ?? "");
           const strategy = normalizeStrategyName(parsed.strategy);
+          const executionWallet = resolveExecutionWalletRecord(typeof parsed.executionWalletId === "string" ? parsed.executionWalletId : "");
           if (!addressId || !walletAddress) {
             sendJson(400, { error: "addressId ve walletAddress zorunludur" });
+            return;
+          }
+          if (!executionWallet) {
+            sendJson(400, { error: "Gerçek trade için önce bir execution wallet seçin veya ekleyin." });
             return;
           }
 
@@ -3267,6 +3501,8 @@ const createPolymarketTrackerPlugin = (): Plugin => ({
             walletAddress,
             strategy,
             config: parseCopySessionConfig(parsed.config ?? {}),
+            executionWalletId: executionWallet.id,
+            executionWalletNickname: executionWallet.nickName,
             status: "running",
             startedAt: utcNowIso(),
             marketBuyCounts: {},
@@ -3474,8 +3710,9 @@ const createPolymarketTrackerPlugin = (): Plugin => ({
               return;
             }
           }
-          if (!hasPrivateKey()) {
-            sendJson(400, { error: "POLYMARKET_PRIVATE_KEY ayarlı değil." });
+          const executionWallet = resolveExecutionWalletRecord(typeof parsed.executionWalletId === "string" ? parsed.executionWalletId : "");
+          if (!executionWallet) {
+            sendJson(400, { error: "Execution wallet seçilmedi veya bulunamadı." });
             return;
           }
 
@@ -3505,6 +3742,7 @@ const createPolymarketTrackerPlugin = (): Plugin => ({
           try {
             const payload = await enqueueOrderJob(walletAddress || "__global__", async () => executeRealTradeOrder({
               ...parsed,
+              executionWalletId: executionWallet.id,
               requestId,
               source,
               detectedAt,
