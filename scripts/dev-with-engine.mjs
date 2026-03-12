@@ -9,6 +9,7 @@ const nodeCmd = process.platform === 'win32' ? 'node.exe' : 'node';
 let viteProcess = null;
 let engineProcess = null;
 let shuttingDown = false;
+const RESTART_DELAY_MS = 1000;
 
 const shutdown = (code = 0) => {
   if (shuttingDown) return;
@@ -30,10 +31,13 @@ const startTrackerEngine = () => {
     stdio: 'inherit',
     env: process.env,
   });
-  engineProcess.on('exit', (code) => {
-    if (!shuttingDown && code && code !== 0) {
-      shutdown(code);
-    }
+  engineProcess.on('exit', (code, signal) => {
+    engineProcess = null;
+    if (shuttingDown) return;
+    console.error(`[tracker-engine] exited (code=${code ?? 'null'} signal=${signal ?? 'none'}), restarting...`);
+    setTimeout(() => {
+      if (!shuttingDown) startTrackerEngine();
+    }, RESTART_DELAY_MS);
   });
 };
 
@@ -43,10 +47,13 @@ const startVite = () => {
     stdio: 'inherit',
     env: process.env,
   });
-  viteProcess.on('exit', (code) => {
-    if (!shuttingDown) {
-      shutdown(code ?? 0);
-    }
+  viteProcess.on('exit', (code, signal) => {
+    viteProcess = null;
+    if (shuttingDown) return;
+    console.error(`[vite] exited (code=${code ?? 'null'} signal=${signal ?? 'none'}), restarting...`);
+    setTimeout(() => {
+      if (!shuttingDown) startVite();
+    }, RESTART_DELAY_MS);
   });
 };
 

@@ -1,0 +1,8 @@
+aiohttp
+beautifulsoup4
+openai
+playwright
+py-clob-client
+python-dateutil
+requests
+websockets

@@ -263,11 +263,22 @@ export type BackendCopySession = {
   addressId: string;
   walletAddress: string;
   strategy: string;
+  config?: CopySessionConfigPayload;
   status: 'running' | 'syncing' | 'idle';
   startedAt: string;
   processedCount: number;
   copiedCount: number;
   failedCount: number;
+  marketBuyCounts?: Record<string, number>;
+  openOrderKeys?: Record<string, {
+    requestId: string;
+    orderId: string | null;
+    openedAt: string;
+    marketKey: string;
+    outcomeKey: string;
+    side: string;
+    status: string;
+  }>;
 };
 
 export type OrderStatsResponse = {
@@ -276,6 +287,7 @@ export type OrderStatsResponse = {
   matched: number;
   open: number;
   cancelled: number;
+  blocked: number;
   failed: number;
   applied: number;
   unapplied: number;
@@ -482,10 +494,17 @@ export async function listCopySessions(): Promise<{ sessions: BackendCopySession
   return response.json() as Promise<{ sessions: BackendCopySession[] }>;
 }
 
-export async function getOrderHistory(limit = 200, wallet?: string): Promise<{ records: TrackerMonitorRecord[] }> {
+export async function getOrderHistory(
+  limit = 200,
+  wallet?: string,
+  status?: 'all' | 'matched' | 'open' | 'cancelled' | 'blocked' | 'error',
+  wallets?: string[],
+): Promise<{ records: TrackerMonitorRecord[] }> {
   const params = new URLSearchParams();
   params.set('limit', String(Math.max(1, Math.floor(limit))));
   if (wallet?.trim()) params.set('wallet', wallet.trim().toLowerCase());
+  if (status && status !== 'all') params.set('status', status);
+  if (wallets && wallets.length > 0) params.set('wallets', wallets.map((item) => item.trim().toLowerCase()).filter(Boolean).join(','));
   const response = await fetch(`/api/tracker/order-history?${params.toString()}`, { cache: 'no-store' });
   if (!response.ok) {
     const text = await response.text();

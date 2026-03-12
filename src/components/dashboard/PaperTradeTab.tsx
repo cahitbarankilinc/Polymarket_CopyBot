@@ -14,12 +14,11 @@ import {
   clearOrderHistory,
   getMarketQuote,
   getOrderHistory,
-  getOrderStats,
   getWalletEventsWithStats,
   listCopySessions,
   startCopySession,
   stopCopySession,
-  type OrderStatsResponse,
+  type CopySessionConfigPayload,
   type TrackerMonitorRecord,
   type WalletTrackerEvent,
 } from '@/lib/polymarketTrackerApi';
@@ -211,6 +210,7 @@ const resolveMarketKey = (event: WalletTrackerEvent): string | null => {
 
 const TRACKER_POLL_MS = 1000;
 const TRACKER_EVENTS_LIMIT = 250;
+const ORDER_HISTORY_UI_LIMIT = 500;
 const QUOTE_RETRY_DELAY_MS = 500;
 const QUOTE_MAX_ATTEMPTS = 3;
 
@@ -225,9 +225,20 @@ const getOrderStatusMeta = (statusRaw?: string | null) => {
   if (status === 'matched') return { icon: '✅', label: 'matched', className: 'text-emerald-600' };
   if (status === 'live' || status === 'live_open') return { icon: '⏳', label: 'open', className: 'text-amber-600' };
   if (status === 'cancelled_after_timeout') return { icon: '❌', label: 'cancelled', className: 'text-orange-600' };
-  if (status === 'error' || status === 'blocked') return { icon: '❌', label: status || 'error', className: 'text-destructive' };
+  if (status === 'blocked') return { icon: '⚪', label: 'skipped', className: 'text-muted-foreground' };
+  if (status === 'error') return { icon: '❌', label: 'error', className: 'text-destructive' };
   if (status === 'pending') return { icon: '⏳', label: 'pending', className: 'text-amber-600' };
   return { icon: '⏳', label: status || 'pending', className: 'text-muted-foreground' };
+};
+
+const normalizeOrderFilterStatus = (statusRaw?: string | null): 'matched' | 'open' | 'cancelled' | 'blocked' | 'error' | 'other' => {
+  const status = (statusRaw ?? '').trim().toLowerCase();
+  if (status === 'matched') return 'matched';
+  if (status === 'live' || status === 'live_open') return 'open';
+  if (status === 'cancelled_after_timeout') return 'cancelled';
+  if (status === 'blocked') return 'blocked';
+  if (status === 'error') return 'error';
+  return 'other';
 };
 
 const stringifyJson = (value: unknown): string => {
@@ -273,6 +284,149 @@ const extractOrderIdFromPayload = (payload: unknown): string | null => {
   return null;
 };
 
+const getRecordField = (value: unknown): string | null => {
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+};
+
+const getPayloadRecord = (value: unknown): Record<string, unknown> | null => {
+  return value && typeof value === 'object' ? value as Record<string, unknown> : null;
+};
+
+const isPlaceholderMarket = (value: string | null): boolean => {
+  if (!value) return true;
+  const normalized = value.trim().toLowerCase();
+  return !normalized || normalized === '-' || normalized.startsWith('asset-');
+};
+
+const isPlaceholderOutcome = (value: string | null): boolean => {
+  if (!value) return true;
+  const normalized = value.trim().toLowerCase();
+  return !normalized || normalized === '-' || normalized === 'unknown';
+};
+
+const getScriptPlaceRecord = (value: unknown): Record<string, unknown> | null => {
+  const payload = getPayloadRecord(value);
+  const script = getPayloadRecord(payload?.script);
+  return getPayloadRecord(script?.place);
+};
+
+const resolveHistoryMarket = (row: TrackerMonitorRecord): string => {
+  const directMarketSlug = getRecordField(row.market_slug);
+  const directMarket = getRecordField(row.market);
+  if (!isPlaceholderMarket(directMarketSlug)) return directMarketSlug as string;
+  if (!isPlaceholderMarket(directMarket)) return directMarket as string;
+  const response = getPayloadRecord(row.response_payload);
+  const request = getPayloadRecord(row.request_payload);
+  const responsePlace = getScriptPlaceRecord(row.response_payload);
+  const requestPlace = getScriptPlaceRecord(row.request_payload);
+  const candidates = [
+    directMarketSlug,
+    directMarket,
+    getRecordField(response?.marketSlug),
+    getRecordField(response?.market),
+    getRecordField(responsePlace?.marketSlug),
+    getRecordField(responsePlace?.market),
+    getRecordField(request?.marketSlug),
+    getRecordField(request?.market),
+    getRecordField(requestPlace?.marketSlug),
+    getRecordField(requestPlace?.market),
+  ].filter((candidate): candidate is string => Boolean(candidate));
+
+  return candidates.find((candidate) => !isPlaceholderMarket(candidate)) || candidates[0] || '-';
+};
+
+const resolveHistoryOutcome = (row: TrackerMonitorRecord): string => {
+  const direct = getRecordField(row.outcome);
+  if (!isPlaceholderOutcome(direct)) return direct as string;
+  const response = getPayloadRecord(row.response_payload);
+  const request = getPayloadRecord(row.request_payload);
+  const responsePlace = getScriptPlaceRecord(row.response_payload);
+  const requestPlace = getScriptPlaceRecord(row.request_payload);
+  const candidates = [
+    direct,
+    getRecordField(response?.outcome),
+    getRecordField(responsePlace?.outcome),
+    getRecordField(request?.outcome),
+    getRecordField(requestPlace?.outcome),
+  ].filter((candidate): candidate is string => Boolean(candidate));
+
+  return candidates.find((candidate) => !isPlaceholderOutcome(candidate)) || candidates[0] || '-';
+};
+
+const resolveHistoryTradeUsd = (row: TrackerMonitorRecord): number | null => {
+  const response = getPayloadRecord(row.response_payload);
+  const request = getPayloadRecord(row.request_payload);
+  const rawResponse = getPayloadRecord(response?.rawResponse);
+  const side = getRecordField(row.side) || getRecordField(response?.side);
+  const candidates = [
+    response?.tradeUsd,
+    side === 'BUY' ? rawResponse?.makingAmount : rawResponse?.takingAmount,
+    response?.sourceValueUsd,
+    request?.tradeUsd,
+    row.value_usd,
+  ];
+  for (const candidate of candidates) {
+    if (typeof candidate === 'number' && Number.isFinite(candidate)) return candidate;
+    if (typeof candidate === 'string') {
+      const parsed = Number(candidate);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+  }
+  return null;
+};
+
+const resolveHistoryRequestedPrice = (row: TrackerMonitorRecord): number | null => {
+  const response = getPayloadRecord(row.response_payload);
+  const request = getPayloadRecord(row.request_payload);
+  const candidates = [response?.requestedPrice, request?.price, row.price];
+  for (const candidate of candidates) {
+    if (typeof candidate === 'number' && Number.isFinite(candidate)) return candidate;
+  }
+  return null;
+};
+
+const resolveHistoryExecutedPrice = (row: TrackerMonitorRecord): number | null => {
+  const response = getPayloadRecord(row.response_payload);
+  const rawResponse = getPayloadRecord(response?.rawResponse);
+  const side = getRecordField(row.side) || getRecordField(response?.side);
+  const makingAmount = rawResponse && typeof rawResponse.makingAmount === 'string'
+    ? Number(rawResponse.makingAmount)
+    : typeof rawResponse?.makingAmount === 'number'
+      ? rawResponse.makingAmount
+      : null;
+  const takingAmount = rawResponse && typeof rawResponse.takingAmount === 'string'
+    ? Number(rawResponse.takingAmount)
+    : typeof rawResponse?.takingAmount === 'number'
+      ? rawResponse.takingAmount
+      : null;
+
+  if (side === 'BUY' && makingAmount && takingAmount && Number.isFinite(makingAmount) && Number.isFinite(takingAmount) && takingAmount > 0) {
+    return makingAmount / takingAmount;
+  }
+  if (side === 'SELL' && makingAmount && takingAmount && Number.isFinite(makingAmount) && Number.isFinite(takingAmount) && makingAmount > 0) {
+    return takingAmount / makingAmount;
+  }
+
+  const fallbackCandidates = [response?.limitPrice, response?.marketQuotePrice, response?.requestedPrice];
+  for (const candidate of fallbackCandidates) {
+    if (typeof candidate === 'number' && Number.isFinite(candidate)) return candidate;
+  }
+  return null;
+};
+
+const average = (values: number[]): number | null => {
+  if (!values.length) return null;
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
+};
+
+const formatMetricUsd = (value: number): string => `$${value.toLocaleString('tr-TR', { maximumFractionDigits: 2 })}`;
+
+const formatMetricCents = (value: number | null): string => (
+  value === null
+    ? '-'
+    : `${value.toLocaleString('tr-TR', { maximumFractionDigits: 2 })}¢`
+);
+
 const compactOrderId = (value: string): string => {
   if (value.length <= 18) return value;
   return `${value.slice(0, 10)}...${value.slice(-8)}`;
@@ -290,6 +444,41 @@ const normalizeStrategyName = (value: string | undefined): string => {
 };
 
 const buildSessionKey = (addressId: string, strategy: string): string => `${addressId}::${normalizeStrategyName(strategy)}`;
+
+const extractStrategyFromSessionKey = (sessionKey: string): string => {
+  const separatorIndex = sessionKey.indexOf('::');
+  if (separatorIndex < 0) return normalizeStrategyName(sessionKey);
+  return normalizeStrategyName(sessionKey.slice(separatorIndex + 2));
+};
+
+const stringifyConfigNumber = (value: number | null | undefined, fallback = ''): string => (
+  typeof value === 'number' && Number.isFinite(value) ? String(value) : fallback
+);
+
+const toWalletModeConfig = (
+  config: CopySessionConfigPayload,
+  strategy: string,
+  existing?: WalletModeConfig,
+): WalletModeConfig => ({
+  ...defaultConfig,
+  ...existing,
+  mode: config.mode,
+  sourceTradeUsd: stringifyConfigNumber(config.sourceTradeUsd, existing?.sourceTradeUsd ?? defaultConfig.sourceTradeUsd),
+  leaderFreeBalance: stringifyConfigNumber(config.leaderFreeBalance, existing?.leaderFreeBalance ?? defaultConfig.leaderFreeBalance),
+  multiplier: stringifyConfigNumber(config.multiplier, existing?.multiplier ?? defaultConfig.multiplier),
+  fixedAmount: stringifyConfigNumber(config.fixedAmount, existing?.fixedAmount ?? defaultConfig.fixedAmount),
+  buyWaitLimit: stringifyConfigNumber(config.buyWaitLimit, existing?.buyWaitLimit ?? defaultConfig.buyWaitLimit),
+  fixedShares: stringifyConfigNumber(config.fixedShares, existing?.fixedShares ?? defaultConfig.fixedShares),
+  sharePrice: stringifyConfigNumber(config.sharePrice, existing?.sharePrice ?? defaultConfig.sharePrice),
+  slippageCents: stringifyConfigNumber(config.slippageCents, existing?.slippageCents ?? defaultConfig.slippageCents),
+  useSlippage: config.useSlippage !== false,
+  centRangeMin: stringifyConfigNumber(config.centRangeMin, ''),
+  centRangeMax: stringifyConfigNumber(config.centRangeMax, ''),
+  shareRangeMin: stringifyConfigNumber(config.shareRangeMin, ''),
+  shareRangeMax: stringifyConfigNumber(config.shareRangeMax, ''),
+  strategy: normalizeStrategyName(strategy),
+  direction: existing?.direction ?? defaultConfig.direction,
+});
 
 const parseOptionalNumber = (value: string | undefined): number | null => {
   const trimmed = (value ?? '').trim();
@@ -447,6 +636,7 @@ export default function PaperTradeTab({
   const { addresses, paperTrades, startPaperTrade, paperBudget, setPaperBudget } = useDashboard();
   const [setupId, setSetupId] = useState<string | null>(preselectedId || null);
   const [setupStrategy, setSetupStrategy] = useState(defaultConfig.strategy);
+  const [setupStrategyDraft, setSetupStrategyDraft] = useState(defaultConfig.strategy);
   const [collapsed, setCollapsed] = useState(false);
   const [budgetMode, setBudgetMode] = useState<'unlimited' | 'limited'>(paperBudget.mode);
   const [budgetType, setBudgetType] = useState<'daily' | 'total'>(paperBudget.type);
@@ -463,7 +653,8 @@ export default function PaperTradeTab({
   const [activityQuotes, setActivityQuotes] = useState<Record<string, ActivityQuoteState>>({});
   const [trackingHistory, setTrackingHistory] = useState<TrackingHistoryItem[]>([]);
   const [orderHistoryRows, setOrderHistoryRows] = useState<TrackerMonitorRecord[]>([]);
-  const [orderStats, setOrderStats] = useState<OrderStatsResponse | null>(null);
+  const [orderStatusFilter, setOrderStatusFilter] = useState<'all' | 'matched' | 'open' | 'cancelled' | 'blocked' | 'error'>('all');
+  const [selectedOrderWallets, setSelectedOrderWallets] = useState<string[]>([]);
   const [isClearingOrderHistory, setIsClearingOrderHistory] = useState(false);
   const copySessionsRef = useRef(copySessions);
   const walletConfigsRef = useRef(walletConfigs);
@@ -478,6 +669,81 @@ export default function PaperTradeTab({
     walletConfigsRef.current = walletConfigs;
   }, [walletConfigs]);
 
+  const getKnownStrategiesForWallet = useCallback((addressId: string | null): string[] => {
+    if (!addressId) return [];
+
+    const strategies = new Set<string>();
+
+    for (const session of Object.values(copySessions)) {
+      if (session.addressId === addressId) strategies.add(normalizeStrategyName(session.strategy));
+    }
+
+    for (const sessionKey of Object.keys(walletConfigs)) {
+      if (sessionKey.startsWith(`${addressId}::`)) strategies.add(extractStrategyFromSessionKey(sessionKey));
+    }
+
+    for (const item of trackingHistory) {
+      if (item.addressId === addressId) strategies.add(normalizeStrategyName(item.strategy));
+    }
+
+    return Array.from(strategies);
+  }, [copySessions, trackingHistory, walletConfigs]);
+
+  const getPreferredStrategyForWallet = useCallback((addressId: string | null): string => {
+    if (!addressId) return defaultConfig.strategy;
+
+    const runningSession = Object.values(copySessions).find((session) => (
+      session.addressId === addressId && (session.status === 'running' || session.status === 'syncing')
+    ));
+    if (runningSession) return normalizeStrategyName(runningSession.strategy);
+
+    const knownStrategies = getKnownStrategiesForWallet(addressId);
+    return knownStrategies[0] || defaultConfig.strategy;
+  }, [copySessions, getKnownStrategiesForWallet]);
+
+  const selectSetupTarget = useCallback((addressId: string | null, strategy?: string | null) => {
+    const resolvedStrategy = addressId
+      ? normalizeStrategyName(strategy || getPreferredStrategyForWallet(addressId))
+      : defaultConfig.strategy;
+    setSetupId(addressId);
+    setSetupStrategy(resolvedStrategy);
+    setSetupStrategyDraft(resolvedStrategy);
+    setCollapsed(false);
+  }, [getPreferredStrategyForWallet]);
+
+  const commitStrategySelection = useCallback((nextStrategyValue: string): string => {
+    const normalizedStrategy = normalizeStrategyName(nextStrategyValue);
+
+    if (!setupId) {
+      setSetupStrategy(normalizedStrategy);
+      setSetupStrategyDraft(normalizedStrategy);
+      return normalizedStrategy;
+    }
+
+    const previousKey = buildSessionKey(setupId, setupStrategy);
+    const nextKey = buildSessionKey(setupId, normalizedStrategy);
+
+    setSetupStrategy(normalizedStrategy);
+    setSetupStrategyDraft(normalizedStrategy);
+
+    if (previousKey !== nextKey) {
+      setWalletConfigs((prev) => {
+        if (prev[nextKey]) return prev;
+        const sourceConfig = prev[previousKey];
+        if (!sourceConfig) return prev;
+        return {
+          ...prev,
+          [nextKey]: {
+            ...sourceConfig,
+            strategy: normalizedStrategy,
+          },
+        };
+      });
+    }
+
+    return normalizedStrategy;
+  }, [setupId, setupStrategy]);
+
   useEffect(() => {
     if (!isRealMode) return;
     let active = true;
@@ -485,15 +751,35 @@ export default function PaperTradeTab({
 
     const tick = async () => {
       try {
-        const [sessionPayload, historyPayload, statsPayload] = await Promise.all([
+        const [sessionPayload, historyPayload] = await Promise.all([
           listCopySessions().catch(() => ({ sessions: [] })),
-          getOrderHistory(200).catch(() => ({ records: [] })),
-          getOrderStats(200).catch(() => null),
+          getOrderHistory(
+            ORDER_HISTORY_UI_LIMIT,
+            undefined,
+            orderStatusFilter,
+            selectedOrderWallets,
+          ).catch(() => ({ records: [] })),
         ]);
 
         if (!active) return;
 
         const sessionsMap: Record<string, CopySessionState> = {};
+        setWalletConfigs((prev) => {
+          let changed = false;
+          const next = { ...prev };
+
+          for (const item of sessionPayload.sessions) {
+            if (!item.config) continue;
+            const sessionKey = buildSessionKey(item.addressId, item.strategy);
+            const nextConfig = toWalletModeConfig(item.config, item.strategy, prev[sessionKey]);
+            if (JSON.stringify(prev[sessionKey]) === JSON.stringify(nextConfig)) continue;
+            next[sessionKey] = nextConfig;
+            changed = true;
+          }
+
+          return changed ? next : prev;
+        });
+
         for (const item of sessionPayload.sessions) {
           const sessionKey = buildSessionKey(item.addressId, item.strategy);
           sessionsMap[sessionKey] = {
@@ -501,12 +787,11 @@ export default function PaperTradeTab({
             strategy: item.strategy,
             startedAt: new Date(item.startedAt),
             status: item.status === 'syncing' ? 'syncing' : (item.status === 'running' ? 'running' : 'idle'),
-            marketBuyCounts: {},
+            marketBuyCounts: item.marketBuyCounts || {},
           };
         }
         setCopySessions(sessionsMap);
         setOrderHistoryRows(Array.isArray(historyPayload.records) ? historyPayload.records : []);
-        setOrderStats(statsPayload);
       } finally {
         if (active) {
           timer = window.setTimeout(() => {
@@ -521,7 +806,7 @@ export default function PaperTradeTab({
       active = false;
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [isRealMode]);
+  }, [isRealMode, orderStatusFilter, selectedOrderWallets]);
 
   const loadAutoConfig = async (addressId: string, strategy: string): Promise<WalletModeConfig | null> => {
     const targetAddress = addresses.find((address) => address.id === addressId);
@@ -567,16 +852,14 @@ export default function PaperTradeTab({
 
   useEffect(() => {
     if (preselectedId) {
-      setSetupId(preselectedId);
-      setSetupStrategy(defaultConfig.strategy);
-      setCollapsed(false);
+      selectSetupTarget(preselectedId, getPreferredStrategyForWallet(preselectedId));
     }
-  }, [preselectedId]);
+  }, [getPreferredStrategyForWallet, preselectedId, selectSetupTarget]);
 
   useEffect(() => {
     if (setupId || preselectedId || addresses.length === 0) return;
-    setSetupId(addresses[0].id);
-  }, [addresses, preselectedId, setupId]);
+    selectSetupTarget(addresses[0].id, getPreferredStrategyForWallet(addresses[0].id));
+  }, [addresses, getPreferredStrategyForWallet, preselectedId, selectSetupTarget, setupId]);
 
   useEffect(() => {
     if (!setupId || !prefill) return;
@@ -597,7 +880,22 @@ export default function PaperTradeTab({
   useEffect(() => {
     if (!setupId) return;
     loadAutoConfig(setupId, setupStrategy);
-  }, [setupId, addresses]);
+  }, [addresses, setupId, setupStrategy]);
+
+  useEffect(() => {
+    setSetupStrategyDraft(normalizeStrategyName(setupStrategy));
+  }, [setupStrategy]);
+
+  useEffect(() => {
+    if (!setupId) return;
+    const knownStrategies = getKnownStrategiesForWallet(setupId);
+    if (knownStrategies.length === 0) return;
+    const normalizedCurrentStrategy = normalizeStrategyName(setupStrategy);
+    if (knownStrategies.includes(normalizedCurrentStrategy)) return;
+    const preferredStrategy = getPreferredStrategyForWallet(setupId);
+    setSetupStrategy(preferredStrategy);
+    setSetupStrategyDraft(preferredStrategy);
+  }, [getKnownStrategiesForWallet, getPreferredStrategyForWallet, setupId, setupStrategy]);
 
   const currentConfig = activeConfigKey ? (walletConfigs[activeConfigKey] || { ...defaultConfig, strategy: normalizeStrategyName(setupStrategy) }) : defaultConfig;
 
@@ -653,16 +951,34 @@ export default function PaperTradeTab({
         walletAddress: wallet?.address,
       };
     }), [addresses, copySessions]);
-  const passiveSessions = useMemo(() => addresses
-    .filter((wallet) => !Object.values(copySessions).some((session) => (
-      session.addressId === wallet.id && (session.status === 'running' || session.status === 'syncing')
-    )))
-    .map((wallet) => ({
-      addressId: wallet.id,
-      strategy: defaultConfig.strategy,
-      walletName: wallet.username || wallet.label || wallet.address || wallet.id,
-      walletAddress: wallet.address,
-    })), [addresses, copySessions]);
+  const passiveSessions = useMemo(() => {
+    const items: Array<{
+      addressId: string;
+      strategy: string;
+      walletName: string;
+      walletAddress?: string;
+    }> = [];
+
+    for (const wallet of addresses) {
+      const knownStrategies = getKnownStrategiesForWallet(wallet.id);
+      const strategies = knownStrategies.length > 0 ? knownStrategies : [defaultConfig.strategy];
+
+      for (const strategy of strategies) {
+        const sessionKey = buildSessionKey(wallet.id, strategy);
+        const session = copySessions[sessionKey];
+        if (session && (session.status === 'running' || session.status === 'syncing')) continue;
+
+        items.push({
+          addressId: wallet.id,
+          strategy,
+          walletName: wallet.username || wallet.label || wallet.address || wallet.id,
+          walletAddress: wallet.address,
+        });
+      }
+    }
+
+    return items;
+  }, [addresses, copySessions, getKnownStrategiesForWallet]);
 
   const analysisTrades = useMemo(
     () => {
@@ -820,31 +1136,110 @@ export default function PaperTradeTab({
     return Array.from(grouped.entries()).map(([price, values]) => ({ price, ...values })).sort((a, b) => a.price - b.price);
   }, [analysisTrades]);
 
-  const realOrderStats = useMemo(() => {
-    if (orderStats) return orderStats;
-    const total = orderHistoryRows.length;
-    const matched = orderHistoryRows.filter((row) => row.status === 'matched').length;
-    const open = orderHistoryRows.filter((row) => row.status === 'live_open' || row.status === 'live').length;
-    const cancelled = orderHistoryRows.filter((row) => row.status === 'cancelled_after_timeout').length;
-    const failed = orderHistoryRows.filter((row) => row.status === 'error' || row.status === 'blocked').length;
-    const applied = matched;
-    const unapplied = cancelled + failed;
-    const pending = open;
+  const filteredOrderHistoryRows = useMemo(() => {
+    return orderHistoryRows.filter((row) => {
+      const statusMatch = orderStatusFilter === 'all' || normalizeOrderFilterStatus(row.status) === orderStatusFilter;
+      const walletMatch = selectedOrderWallets.length === 0 || selectedOrderWallets.includes(row.wallet.toLowerCase());
+      return statusMatch && walletMatch;
+    });
+  }, [orderHistoryRows, orderStatusFilter, selectedOrderWallets]);
+
+  const orderWalletOptions = useMemo(() => {
+    const byWallet = new Map<string, { wallet: string; label: string }>();
+
+    for (const address of addresses) {
+      const normalizedWallet = address.address.toLowerCase();
+      byWallet.set(normalizedWallet, {
+        wallet: normalizedWallet,
+        label: address.username || address.label || normalizedWallet,
+      });
+    }
+
+    for (const row of orderHistoryRows) {
+      const normalizedWallet = row.wallet.toLowerCase();
+      if (byWallet.has(normalizedWallet)) continue;
+      const addressMeta = addresses.find((item) => item.address.toLowerCase() === normalizedWallet);
+      const label = addressMeta?.username || addressMeta?.label || normalizedWallet;
+      byWallet.set(normalizedWallet, { wallet: normalizedWallet, label });
+    }
+
+    return Array.from(byWallet.values()).sort((a, b) => a.label.localeCompare(b.label, 'tr'));
+  }, [addresses, orderHistoryRows]);
+
+  useEffect(() => {
+    setSelectedOrderWallets((prev) => prev.filter((wallet) => orderWalletOptions.some((item) => item.wallet === wallet)));
+  }, [orderWalletOptions]);
+
+  const filteredOrderSummary = useMemo(() => {
+    const matched = filteredOrderHistoryRows.filter((row) => normalizeOrderFilterStatus(row.status) === 'matched').length;
+    const open = filteredOrderHistoryRows.filter((row) => normalizeOrderFilterStatus(row.status) === 'open').length;
+    const cancelled = filteredOrderHistoryRows.filter((row) => normalizeOrderFilterStatus(row.status) === 'cancelled').length;
+    const blocked = filteredOrderHistoryRows.filter((row) => normalizeOrderFilterStatus(row.status) === 'blocked').length;
+    const failed = filteredOrderHistoryRows.filter((row) => normalizeOrderFilterStatus(row.status) === 'error').length;
+    const targetCents: number[] = [];
+    const executedCents: number[] = [];
+    const diffCents: number[] = [];
+    let totalSpentUsd = 0;
+    const markets = new Set<string>();
+    const wallets = new Set<string>();
+
+    for (const row of filteredOrderHistoryRows) {
+      wallets.add(row.wallet.toLowerCase());
+      const market = resolveHistoryMarket(row);
+      if (market !== '-') markets.add(market);
+
+      const tradeUsd = resolveHistoryTradeUsd(row);
+      if (typeof tradeUsd === 'number' && Number.isFinite(tradeUsd)) totalSpentUsd += tradeUsd;
+
+      const targetPrice = resolveHistoryRequestedPrice(row);
+      if (typeof targetPrice === 'number' && Number.isFinite(targetPrice)) targetCents.push(targetPrice * 100);
+
+      const executedPrice = resolveHistoryExecutedPrice(row);
+      if (typeof executedPrice === 'number' && Number.isFinite(executedPrice)) executedCents.push(executedPrice * 100);
+
+      if (
+        typeof targetPrice === 'number'
+        && Number.isFinite(targetPrice)
+        && typeof executedPrice === 'number'
+        && Number.isFinite(executedPrice)
+      ) {
+        diffCents.push(Math.abs((executedPrice - targetPrice) * 100));
+      }
+    }
+
     const denominator = matched + cancelled + failed;
-    const successRate = denominator > 0 ? Number(((matched / denominator) * 100).toFixed(2)) : 0;
     return {
-      generatedAt: new Date().toISOString(),
-      total,
+      total: filteredOrderHistoryRows.length,
       matched,
       open,
       cancelled,
+      blocked,
       failed,
-      applied,
-      unapplied,
-      pending,
-      successRate,
+      successRate: denominator > 0 ? Number(((matched / denominator) * 100).toFixed(2)) : 0,
+      totalSpentUsd,
+      marketCount: markets.size,
+      walletCount: wallets.size,
+      avgTargetCents: average(targetCents),
+      avgExecutedCents: average(executedCents),
+      avgDiffCents: average(diffCents),
     };
-  }, [orderHistoryRows, orderStats]);
+  }, [filteredOrderHistoryRows]);
+
+  const selectedWalletFilterLabel = useMemo(() => {
+    if (selectedOrderWallets.length === 0) return 'Tüm walletler';
+    if (selectedOrderWallets.length === 1) {
+      return orderWalletOptions.find((item) => item.wallet === selectedOrderWallets[0])?.label || '1 wallet seçili';
+    }
+    return `${selectedOrderWallets.length} wallet seçili`;
+  }, [orderWalletOptions, selectedOrderWallets]);
+
+  const toggleOrderWalletSelection = (wallet: string) => {
+    setSelectedOrderWallets((prev) => (
+      prev.includes(wallet)
+        ? prev.filter((item) => item !== wallet)
+        : [...prev, wallet]
+    ));
+  };
 
   const setConfig = (patch: Partial<WalletModeConfig>) => {
     if (!setupId || !activeConfigKey) return;
@@ -858,35 +1253,7 @@ export default function PaperTradeTab({
   };
 
   const handleStrategyInputChange = (nextStrategyValue: string) => {
-    if (!setupId) {
-      setSetupStrategy(nextStrategyValue);
-      return;
-    }
-
-    const previousStrategy = setupStrategy;
-    const previousKey = buildSessionKey(setupId, previousStrategy);
-    const nextKey = buildSessionKey(setupId, nextStrategyValue);
-
-    setSetupStrategy(nextStrategyValue);
-
-    if (previousKey === nextKey) return;
-
-    setWalletConfigs((prev) => {
-      const previousConfig = prev[previousKey] || prev[nextKey];
-      if (!previousConfig) return prev;
-
-      const nextConfig: WalletModeConfig = {
-        ...previousConfig,
-        strategy: normalizeStrategyName(nextStrategyValue),
-      };
-
-      const rest = { ...prev };
-      delete rest[previousKey];
-      return {
-        ...rest,
-        [nextKey]: nextConfig,
-      };
-    });
+    setSetupStrategyDraft(nextStrategyValue);
   };
 
   const isWalletSelected = Boolean(setupId);
@@ -1130,7 +1497,7 @@ export default function PaperTradeTab({
 
     setPaperBudget(nextBudget);
 
-    const strategyName = normalizeStrategyName(setupStrategy);
+    const strategyName = commitStrategySelection(setupStrategyDraft);
     const sessionKey = buildSessionKey(setupId, strategyName);
 
     const existingSession = copySessionsRef.current[sessionKey];
@@ -1141,7 +1508,20 @@ export default function PaperTradeTab({
     const rangeError = validateRangeConfig(currentConfig);
     if (rangeError) return toast.error(rangeError);
 
-    const latestConfig = await loadAutoConfig(setupId, strategyName) || currentConfig;
+    const seededConfig = walletConfigsRef.current[sessionKey] || {
+      ...currentConfig,
+      strategy: strategyName,
+    };
+    setWalletConfigs((prev) => (
+      prev[sessionKey]
+        ? prev
+        : {
+          ...prev,
+          [sessionKey]: seededConfig,
+        }
+    ));
+
+    const latestConfig = await loadAutoConfig(setupId, strategyName) || seededConfig;
     const latestConfigRangeError = validateRangeConfig(latestConfig);
     if (latestConfigRangeError) return toast.error(latestConfigRangeError);
 
@@ -1312,14 +1692,6 @@ export default function PaperTradeTab({
     try {
       const result = await clearOrderHistory();
       setOrderHistoryRows([]);
-      setOrderStats({
-        generatedAt: result.clearedAt,
-        total: 0,
-        applied: 0,
-        unapplied: 0,
-        pending: 0,
-        successRate: 0,
-      });
       toast.success(`Geçmiş temizlendi (${result.removed} kayıt silindi).`);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Order geçmişi temizlenemedi';
@@ -1328,6 +1700,10 @@ export default function PaperTradeTab({
       setIsClearingOrderHistory(false);
     }
   };
+
+  const selectedWalletStrategies = useMemo(() => (
+    setupId ? getKnownStrategiesForWallet(setupId) : []
+  ), [getKnownStrategiesForWallet, setupId]);
 
   const selectedSession = activeConfigKey ? copySessions[activeConfigKey] : undefined;
   const isSelectedRunning = selectedSession?.status === 'running' || selectedSession?.status === 'syncing';
@@ -1354,7 +1730,7 @@ export default function PaperTradeTab({
               <Wallet className="w-4 h-4 text-primary" />
               <select
                 value={setupId || ''}
-                onChange={(e) => { setSetupId(e.target.value || null); setSetupStrategy(defaultConfig.strategy); setCollapsed(false); }}
+                onChange={(e) => { selectSetupTarget(e.target.value || null); }}
                 className="w-full px-3 py-2 rounded-lg bg-secondary/50 border border-border/30 text-sm"
               >
                 <option value="">Cüzdan seçin...</option>
@@ -1363,6 +1739,20 @@ export default function PaperTradeTab({
                 ))}
               </select>
             </div>
+            {setupId && selectedWalletStrategies.length > 1 && (
+              <div className="mt-3">
+                <label className="text-[11px] font-medium text-muted-foreground mb-1 block">Bu cüzdan için kayıtlı stratejiler</label>
+                <select
+                  value={normalizeStrategyName(setupStrategy)}
+                  onChange={(e) => { selectSetupTarget(setupId, e.target.value); }}
+                  className="w-full px-3 py-2 rounded-lg bg-secondary/40 border border-border/30 text-xs"
+                >
+                  {selectedWalletStrategies.map((strategy) => (
+                    <option key={strategy} value={strategy}>{strategy}</option>
+                  ))}
+                </select>
+              </div>
+            )}
             {Object.entries(copySessions).some(([, session]) => session.status !== 'idle') && (
               <div className="mt-3 rounded-lg border border-primary/30 bg-primary/5 p-2 text-xs text-primary">
                 Takip aktif: {Object.entries(copySessions)
@@ -1503,7 +1893,6 @@ export default function PaperTradeTab({
                       value={currentConfig.mode}
                       onChange={(e) => {
                         const nextMode = e.target.value as CopyMode;
-                        setSetupStrategy(getCopyModeLabel(nextMode));
                         setConfig({ mode: nextMode });
                         if (nextMode === 'proportional') {
                           setBudgetMode('limited');
@@ -1548,8 +1937,15 @@ export default function PaperTradeTab({
                         <span className="mb-1 block text-[11px] text-muted-foreground">Trade Stratejisi</span>
                         <input
                           type="text"
-                          value={setupStrategy}
+                          value={setupStrategyDraft}
                           onChange={(e) => handleStrategyInputChange(e.target.value)}
+                          onBlur={() => { commitStrategySelection(setupStrategyDraft); }}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') {
+                              e.preventDefault();
+                              commitStrategySelection(setupStrategyDraft);
+                            }
+                          }}
                           className="w-full px-3 py-2 rounded-lg bg-secondary/50 border border-border/30 text-sm"
                           placeholder="Strateji"
                         />
@@ -1623,6 +2019,13 @@ export default function PaperTradeTab({
                           <span className="px-2 py-1 rounded text-[10px] font-semibold bg-secondary/60 text-foreground">Aktif Trade: {activeTradeCount}</span>
                           <button
                             type="button"
+                            onClick={() => { selectSetupTarget(addressId, strategy); }}
+                            className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg text-[11px] font-medium border border-border/40 bg-secondary/40 text-foreground hover:bg-secondary/60"
+                          >
+                            Yükle
+                          </button>
+                          <button
+                            type="button"
                             onClick={() => { void handleStop(sessionKey); }}
                             className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg text-[11px] font-medium border border-warning/40 bg-warning/10 text-warning hover:bg-warning/20"
                           >
@@ -1644,9 +2047,9 @@ export default function PaperTradeTab({
             ) : (
               <div className="space-y-2">
                 {passiveSessions.map(({ addressId, strategy, walletName, walletAddress }) => {
-                  const activeTradeCount = activeTrades.filter((trade) => trade.addressId === addressId).length;
+                  const activeTradeCount = activeTrades.filter((trade) => trade.addressId === addressId && trade.strategy === strategy).length;
                   return (
-                    <div key={addressId} className="glass-card p-4 border border-border/30">
+                    <div key={`${addressId}-${strategy}`} className="glass-card p-4 border border-border/30">
                       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
                         <div>
                           <p className="text-xs font-semibold text-foreground">{walletName} <span className="text-muted-foreground">• {strategy}</span></p>
@@ -1656,6 +2059,13 @@ export default function PaperTradeTab({
                         <div className="flex items-center gap-2">
                           <span className="px-2 py-1 rounded text-[10px] font-semibold bg-secondary/60 text-foreground">TAKİP PASİF</span>
                           <span className="px-2 py-1 rounded text-[10px] font-semibold bg-secondary/60 text-foreground">Aktif Trade: {activeTradeCount}</span>
+                          <button
+                            type="button"
+                            onClick={() => { selectSetupTarget(addressId, strategy); }}
+                            className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg text-[11px] font-medium border border-border/40 bg-secondary/40 text-foreground hover:bg-secondary/60"
+                          >
+                            Yükle
+                          </button>
                         </div>
                       </div>
                     </div>
@@ -1698,26 +2108,86 @@ export default function PaperTradeTab({
           {isRealMode && (
             <div className="mb-6 glass-card p-5">
               <div className="mb-3 flex items-center justify-between gap-3">
-                <h3 className="text-sm font-semibold text-foreground">Kopya Trade Geçmişi (Son 200)</h3>
-                <button
-                  type="button"
-                  onClick={() => { void handleClearOrderHistory(); }}
-                  disabled={isClearingOrderHistory}
-                  className="inline-flex items-center rounded-md border border-destructive/40 bg-destructive/10 px-2.5 py-1.5 text-[11px] font-medium text-destructive hover:bg-destructive/20 disabled:opacity-60"
-                >
-                  {isClearingOrderHistory ? 'Temizleniyor...' : 'Geçmişi Temizle'}
-                </button>
+                <h3 className="text-sm font-semibold text-foreground">{`Kopya Trade Geçmişi (Seçili Filtre İçin Son ${ORDER_HISTORY_UI_LIMIT})`}</h3>
+                <div className="flex flex-wrap items-center justify-end gap-2">
+                  <details className="relative">
+                    <summary className="cursor-pointer rounded-md border border-border/40 bg-secondary/20 px-2.5 py-1.5 text-[11px] text-foreground list-none">
+                      {selectedWalletFilterLabel}
+                    </summary>
+                    <div className="absolute right-0 z-20 mt-2 w-72 rounded-lg border border-border/40 bg-background/95 p-3 shadow-2xl backdrop-blur">
+                      <div className="mb-2 flex items-center justify-between gap-2">
+                        <p className="text-[11px] font-medium text-foreground">Wallet filtresi</p>
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={(event) => {
+                              event.preventDefault();
+                              setSelectedOrderWallets(orderWalletOptions.map((item) => item.wallet));
+                            }}
+                            className="text-[10px] text-primary"
+                          >
+                            Tümünü Seç
+                          </button>
+                          <button
+                            type="button"
+                            onClick={(event) => {
+                              event.preventDefault();
+                              setSelectedOrderWallets([]);
+                            }}
+                            className="text-[10px] text-muted-foreground"
+                          >
+                            Temizle
+                          </button>
+                        </div>
+                      </div>
+                      <div className="max-h-64 space-y-1 overflow-auto">
+                        {orderWalletOptions.map((item) => (
+                          <label key={item.wallet} className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1 text-[11px] text-foreground hover:bg-secondary/20">
+                            <input
+                              type="checkbox"
+                              checked={selectedOrderWallets.includes(item.wallet)}
+                              onChange={() => toggleOrderWalletSelection(item.wallet)}
+                              className="h-3.5 w-3.5 rounded border-border/40 bg-secondary/40"
+                            />
+                            <span className="min-w-0 truncate">{item.label}</span>
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+                  </details>
+                  <select
+                    value={orderStatusFilter}
+                    onChange={(e) => setOrderStatusFilter(e.target.value as typeof orderStatusFilter)}
+                    className="rounded-md border border-border/40 bg-secondary/20 px-2.5 py-1.5 text-[11px] text-foreground"
+                  >
+                    <option value="all">Tüm Durumlar</option>
+                    <option value="matched">Matched</option>
+                    <option value="open">Açık Emir</option>
+                    <option value="cancelled">İptal</option>
+                    <option value="blocked">Nötr/Skip</option>
+                    <option value="error">Hata</option>
+                  </select>
+                  <button
+                    type="button"
+                    onClick={() => { void handleClearOrderHistory(); }}
+                    disabled={isClearingOrderHistory}
+                    className="inline-flex items-center rounded-md border border-destructive/40 bg-destructive/10 px-2.5 py-1.5 text-[11px] font-medium text-destructive hover:bg-destructive/20 disabled:opacity-60"
+                  >
+                    {isClearingOrderHistory ? 'Temizleniyor...' : 'Geçmişi Temizle'}
+                  </button>
+                </div>
               </div>
-              <div className="grid grid-cols-2 lg:grid-cols-6 gap-2 mb-4">
+              <div className="grid grid-cols-2 lg:grid-cols-7 gap-2 mb-4">
                 {[
-                  { label: 'TOPLAM', value: String(realOrderStats.total) },
-                  { label: 'MATCHED', value: String(realOrderStats.matched ?? realOrderStats.applied) },
-                  { label: 'AÇIK EMİR', value: String(realOrderStats.open ?? realOrderStats.pending) },
-                  { label: 'İPTAL', value: String(realOrderStats.cancelled ?? 0) },
-                  { label: 'HATA/BLOK', value: String(realOrderStats.failed ?? Math.max(0, realOrderStats.unapplied - (realOrderStats.cancelled ?? 0))) },
+                  { label: 'TOPLAM', value: String(filteredOrderSummary.total) },
+                  { label: 'MATCHED', value: String(filteredOrderSummary.matched) },
+                  { label: 'AÇIK EMİR', value: String(filteredOrderSummary.open) },
+                  { label: 'İPTAL', value: String(filteredOrderSummary.cancelled) },
+                  { label: 'NÖTR/SKIP', value: String(filteredOrderSummary.blocked) },
+                  { label: 'HATA', value: String(filteredOrderSummary.failed) },
                   {
                     label: 'BAŞARI ORANI',
-                    value: `%${realOrderStats.successRate.toLocaleString('tr-TR', { maximumFractionDigits: 2 })}`,
+                    value: `%${filteredOrderSummary.successRate.toLocaleString('tr-TR', { maximumFractionDigits: 2 })}`,
                   },
                 ].map((item) => (
                   <div key={item.label} className="rounded-lg border border-border/30 bg-secondary/20 p-3">
@@ -1726,10 +2196,25 @@ export default function PaperTradeTab({
                   </div>
                 ))}
               </div>
+              <div className="grid grid-cols-2 lg:grid-cols-6 gap-2 mb-4">
+                {[
+                  { label: 'TOPLAM HARCAMA', value: formatMetricUsd(filteredOrderSummary.totalSpentUsd) },
+                  { label: 'MARKET SAYISI', value: String(filteredOrderSummary.marketCount) },
+                  { label: 'WALLET SAYISI', value: String(filteredOrderSummary.walletCount) },
+                  { label: 'ORT. HEDEF', value: formatMetricCents(filteredOrderSummary.avgTargetCents) },
+                  { label: 'ORT. ALIM', value: formatMetricCents(filteredOrderSummary.avgExecutedCents) },
+                  { label: 'ORT. FARK', value: formatMetricCents(filteredOrderSummary.avgDiffCents) },
+                ].map((item) => (
+                  <div key={item.label} className="rounded-lg border border-border/30 bg-background/40 p-3">
+                    <p className="text-[10px] text-muted-foreground uppercase tracking-wider mb-1">{item.label}</p>
+                    <p className="text-sm font-semibold text-foreground">{item.value}</p>
+                  </div>
+                ))}
+              </div>
 
-              {orderHistoryRows.length === 0 ? (
+              {filteredOrderHistoryRows.length === 0 ? (
                 <div className="rounded-lg border border-border/30 bg-secondary/10 p-6 text-center text-sm text-muted-foreground">
-                  Henüz order denemesi yok.
+                  Bu filtre için order kaydı yok.
                 </div>
               ) : (
                 <div className="overflow-x-auto rounded-lg border border-border/30">
@@ -1749,9 +2234,11 @@ export default function PaperTradeTab({
                       </tr>
                     </thead>
                     <tbody>
-                      {orderHistoryRows.map((row, index) => {
+                      {filteredOrderHistoryRows.map((row, index) => {
                         const statusMeta = getOrderStatusMeta(row.status);
                         const orderId = extractOrderIdFromPayload(row.response_payload);
+                        const resolvedMarket = resolveHistoryMarket(row);
+                        const resolvedOutcome = resolveHistoryOutcome(row);
                         const walletLabel = addresses.find((item) => item.address.toLowerCase() === row.wallet)?.username
                           || addresses.find((item) => item.address.toLowerCase() === row.wallet)?.label
                           || row.wallet;
@@ -1788,8 +2275,8 @@ export default function PaperTradeTab({
                               <p className="text-foreground">{walletLabel}</p>
                               <p className="font-mono text-[10px] text-muted-foreground">{row.wallet}</p>
                             </td>
-                            <td className="px-3 py-2">{row.market_slug || row.market || '-'}</td>
-                            <td className="px-3 py-2">{row.outcome || '-'}</td>
+                            <td className="px-3 py-2 break-words">{resolvedMarket}</td>
+                            <td className="px-3 py-2 break-words">{resolvedOutcome}</td>
                             <td className="px-3 py-2 font-semibold">{row.side || '-'}</td>
                             <td className="px-3 py-2">
                               <span className="font-mono">P: {priceLabel}</span>
@@ -1823,7 +2310,7 @@ export default function PaperTradeTab({
                                 : '-'}
                             </td>
                             <td className="px-3 py-2 max-w-[320px]">
-                              <p className="text-destructive break-words">{row.error || '-'}</p>
+                              <p className={`${row.status === 'blocked' ? 'text-muted-foreground' : 'text-destructive'} break-words`}>{row.error || '-'}</p>
                               <details className="mt-1">
                                 <summary className="cursor-pointer text-[10px] text-muted-foreground">Detay</summary>
                                 <div className="mt-1 space-y-1">

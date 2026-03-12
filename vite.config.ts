@@ -217,6 +217,15 @@ type BackendCopySession = {
   copiedCount: number;
   failedCount: number;
   startAfterMs: number;
+  openOrderKeys: Record<string, {
+    requestId: string;
+    orderId: string | null;
+    openedAt: string;
+    marketKey: string;
+    outcomeKey: string;
+    side: string;
+    status: string;
+  }>;
 };
 
 type RealTradeScriptPayload = {
@@ -247,11 +256,13 @@ const QUOTE_TTL_MS = 1500;
 const ORDER_GLOBAL_CONCURRENCY = Math.max(1, Number(process.env.POLYMARKET_ORDER_GLOBAL_CONCURRENCY ?? 4));
 const MAX_SESSION_EVENT_KEYS = 5000;
 const HISTORY_DEFAULT_LIMIT = 200;
+const COPY_SESSIONS_FILE = path.join(TRACKING_ROOT, "_copy_sessions.json");
 const USDC_TOKEN_ADDRESS = "0x2791bca1f2de4661ed88a30c99a7a9449aa84174";
 const CTF_TOKEN_ADDRESS = "0x4d97dcd97ec945f40cf65f87097ac5ea0476045";
 const TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 const TRANSFER_SINGLE_TOPIC = "0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f62";
 const copySessions = new Map<string, BackendCopySession>();
+let copySessionsRestored = false;
 
 const trackerRuntime = createTrackerRuntimeManager({
   trackingRoot: TRACKING_ROOT,
@@ -688,6 +699,7 @@ const walletDir = (address: string) => path.join(TRACKING_ROOT, normalizeWallet(
 const stateFile = (address: string) => path.join(walletDir(address), "state.json");
 const eventsFile = (address: string) => path.join(walletDir(address), "events.ndjson");
 const errorsFile = (address: string) => path.join(walletDir(address), "errors.log");
+const walletStorageExists = (address: string) => fs.existsSync(walletDir(address));
 
 const ensureWalletDir = (address: string) => {
   fs.mkdirSync(walletDir(address), { recursive: true });
@@ -708,6 +720,7 @@ const readState = (address: string): TrackerState => {
 };
 
 const writeState = (address: string, state: TrackerState) => {
+  if (!walletStorageExists(address)) return;
   fs.writeFileSync(stateFile(address), JSON.stringify(state, null, 2), "utf-8");
 };
 
@@ -764,12 +777,18 @@ const computeEventStats = (events: NormalizedEvent[]): WalletEventStats => {
 
 const appendEvents = (address: string, events: NormalizedEvent[]) => {
   if (events.length === 0) return;
+  if (!walletStorageExists(address)) return;
   const data = events.map((event) => JSON.stringify(event)).join("\n");
   fs.appendFileSync(eventsFile(address), `${data}\n`, "utf-8");
 };
 
 const appendError = (address: string, message: string) => {
-  fs.appendFileSync(errorsFile(address), `[${utcNowIso()}] ${message}\n`, "utf-8");
+  try {
+    if (!walletStorageExists(address)) return;
+    fs.appendFileSync(errorsFile(address), `[${utcNowIso()}] ${message}\n`, "utf-8");
+  } catch {
+    // Ignore file write failures during tracker cleanup.
+  }
 };
 
 const generateEventId = (raw: RawEvent, source: "activity" | "trades") => {
@@ -1050,6 +1069,118 @@ const parseCopySessionConfig = (raw: Record<string, unknown>): BackendCopySessio
   };
 };
 
+const persistCopySessions = () => {
+  fs.mkdirSync(TRACKING_ROOT, { recursive: true });
+  const payload = {
+    sessions: Array.from(copySessions.values())
+      .filter((session) => session.status !== "idle")
+      .map((session) => ({
+        sessionId: session.sessionId,
+        addressId: session.addressId,
+        walletAddress: session.walletAddress,
+        strategy: session.strategy,
+        config: session.config,
+        status: session.status,
+        startedAt: session.startedAt,
+        marketBuyCounts: session.marketBuyCounts,
+        processedQueue: session.processedQueue,
+        processedCount: session.processedCount,
+        copiedCount: session.copiedCount,
+        failedCount: session.failedCount,
+        startAfterMs: session.startAfterMs,
+        openOrderKeys: session.openOrderKeys,
+      })),
+  };
+  fs.writeFileSync(COPY_SESSIONS_FILE, JSON.stringify(payload, null, 2), "utf-8");
+};
+
+const persistCopySessionsSafe = () => {
+  try {
+    persistCopySessions();
+  } catch (error) {
+    console.error(`[copy-sessions] persist failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+};
+
+const restoreCopySessions = () => {
+  if (copySessionsRestored) return;
+  copySessionsRestored = true;
+  fs.mkdirSync(TRACKING_ROOT, { recursive: true });
+  if (!fs.existsSync(COPY_SESSIONS_FILE)) return;
+
+  try {
+    const raw = JSON.parse(fs.readFileSync(COPY_SESSIONS_FILE, "utf-8")) as { sessions?: Array<Record<string, unknown>> };
+    const sessions = Array.isArray(raw.sessions) ? raw.sessions : [];
+    for (const item of sessions) {
+      const addressId = typeof item.addressId === "string" ? item.addressId.trim() : "";
+      const walletAddress = trackerRuntime.normalizeWallet(item.walletAddress ?? "");
+      const strategy = normalizeStrategyName(typeof item.strategy === "string" ? item.strategy : undefined);
+      if (!addressId || !walletAddress) continue;
+
+      const processedQueue = Array.isArray(item.processedQueue)
+        ? item.processedQueue.filter((value): value is string => typeof value === "string" && value.trim().length > 0).slice(-MAX_SESSION_EVENT_KEYS)
+        : [];
+
+      const sessionId = buildSessionId(addressId, strategy);
+      copySessions.set(sessionId, {
+        sessionId,
+        addressId,
+        walletAddress,
+        strategy,
+        config: parseCopySessionConfig((item.config && typeof item.config === "object") ? item.config as Record<string, unknown> : {}),
+        status: item.status === "syncing" ? "syncing" : "running",
+        startedAt: typeof item.startedAt === "string" && item.startedAt.trim() ? item.startedAt : utcNowIso(),
+        marketBuyCounts: item.marketBuyCounts && typeof item.marketBuyCounts === "object"
+          ? Object.fromEntries(Object.entries(item.marketBuyCounts as Record<string, unknown>).filter(([, value]) => typeof value === "number" && Number.isFinite(value)))
+          : {},
+        processedEventKeys: new Set(processedQueue),
+        processedQueue,
+        processedCount: typeof item.processedCount === "number" && Number.isFinite(item.processedCount) ? item.processedCount : 0,
+        copiedCount: typeof item.copiedCount === "number" && Number.isFinite(item.copiedCount) ? item.copiedCount : 0,
+        failedCount: typeof item.failedCount === "number" && Number.isFinite(item.failedCount) ? item.failedCount : 0,
+        startAfterMs: typeof item.startAfterMs === "number" && Number.isFinite(item.startAfterMs) ? item.startAfterMs : Date.now(),
+        openOrderKeys: item.openOrderKeys && typeof item.openOrderKeys === "object"
+          ? Object.fromEntries(
+            Object.entries(item.openOrderKeys as Record<string, unknown>)
+              .map(([key, value]) => {
+                if (!value || typeof value !== "object") return null;
+                const record = value as Record<string, unknown>;
+                const requestId = typeof record.requestId === "string" ? record.requestId.trim() : "";
+                const openedAt = typeof record.openedAt === "string" ? record.openedAt.trim() : "";
+                const marketKey = typeof record.marketKey === "string" ? record.marketKey.trim().toLowerCase() : "";
+                const outcomeKey = typeof record.outcomeKey === "string" ? record.outcomeKey.trim().toLowerCase() : "";
+                const side = typeof record.side === "string" ? record.side.trim().toUpperCase() : "";
+                const status = typeof record.status === "string" ? record.status.trim().toLowerCase() : "live_open";
+                const orderId = typeof record.orderId === "string" && record.orderId.trim() ? record.orderId.trim() : null;
+                if (!requestId || !openedAt || !marketKey || !outcomeKey || !side) return null;
+                return [key, { requestId, openedAt, marketKey, outcomeKey, side, status, orderId }] as const;
+              })
+              .filter((entry): entry is readonly [string, { requestId: string; orderId: string | null; openedAt: string; marketKey: string; outcomeKey: string; side: string; status: string }] => Boolean(entry)),
+          )
+          : {},
+      });
+      const restoredSession = copySessions.get(sessionId);
+      if (restoredSession) rebuildSessionStateFromMonitor(restoredSession);
+      trackerRuntime.startTracker(walletAddress);
+    }
+  } catch (error) {
+    console.error(`[copy-sessions] restore failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+};
+
+const removeCopySessionsForWallet = (walletAddress: string) => {
+  const normalizedWallet = trackerRuntime.normalizeWallet(walletAddress);
+  if (!normalizedWallet) return 0;
+  let removed = 0;
+  for (const [sessionId, session] of copySessions.entries()) {
+    if (session.walletAddress !== normalizedWallet) continue;
+    copySessions.delete(sessionId);
+    removed += 1;
+  }
+  persistCopySessionsSafe();
+  return removed;
+};
+
 const resolveEventKey = (event: RuntimeNormalizedEvent): string => {
   const txHash = (event.tx_hash ?? "").toLowerCase();
   const assetId = event.asset_id ?? "";
@@ -1066,6 +1197,110 @@ const resolveMarketKey = (event: RuntimeNormalizedEvent): string | null => {
   const assetId = typeof event.asset_id === "string" ? event.asset_id.trim() : "";
   if (assetId) return `asset:${assetId.toLowerCase()}`;
   return null;
+};
+
+const resolveOutcomeKey = (event: RuntimeNormalizedEvent): string => {
+  const outcome = typeof event.outcome === "string" ? event.outcome.trim().toLowerCase() : "";
+  if (outcome) return outcome;
+  const assetId = typeof event.asset_id === "string" ? event.asset_id.trim().toLowerCase() : "";
+  if (assetId) return `asset:${assetId}`;
+  return "unknown";
+};
+
+const resolveSessionOpenOrderKey = (event: RuntimeNormalizedEvent, sideOverride?: string | null): string | null => {
+  const marketKey = resolveMarketKey(event);
+  const side = (sideOverride ?? normalizeSideValue(event.side))?.trim().toUpperCase() ?? "";
+  if (!marketKey || !side) return null;
+  return `${marketKey}|${resolveOutcomeKey(event)}|${side}`;
+};
+
+const isOpenOrderLifecycleStatus = (status: string) => {
+  const normalized = status.trim().toLowerCase();
+  return normalized === "live" || normalized === "live_open";
+};
+
+const normalizeMarketLikeLifecycleStatus = (
+  status: string,
+  orderKind?: string | null,
+): string => {
+  const normalizedStatus = status.trim().toLowerCase();
+  const normalizedOrderKind = typeof orderKind === "string" ? orderKind.trim().toLowerCase() : "";
+  if (normalizedOrderKind === "market-like" && (normalizedStatus === "live" || normalizedStatus === "live_open")) {
+    return "matched";
+  }
+  return normalizedStatus;
+};
+
+const shouldConsumeBuyWaitSlot = (status: string) => {
+  const normalized = status.trim().toLowerCase();
+  return normalized === "matched" || normalized === "live_open" || normalized === "cancelled_after_timeout";
+};
+
+const rebuildSessionStateFromMonitor = (session: BackendCopySession) => {
+  const startedAtMs = Date.parse(session.startedAt);
+  const rows = trackerRuntime.getMonitor(session.walletAddress, 5000)
+    .filter((row) => row.kind === "order")
+    .sort((a, b) => (Date.parse(a.created_at) || 0) - (Date.parse(b.created_at) || 0));
+
+  const rebuiltMarketBuyCounts: Record<string, number> = {};
+  const rebuiltOpenOrderKeys: BackendCopySession["openOrderKeys"] = {};
+
+  for (const row of rows) {
+    const rowCreatedAtMs = Date.parse(row.created_at);
+    if (Number.isFinite(startedAtMs) && Number.isFinite(rowCreatedAtMs) && rowCreatedAtMs < startedAtMs) {
+      continue;
+    }
+
+    const monitorEvent: RuntimeNormalizedEvent = {
+      seen_at_utc: row.detected_at ?? row.created_at,
+      market: row.market ?? null,
+      market_slug: row.market_slug ?? null,
+      outcome: row.outcome ?? null,
+      asset_id: row.asset_id ?? null,
+      side: row.side ?? null,
+      price: row.price ?? null,
+      size: row.size ?? null,
+      value_usd: row.value_usd ?? null,
+      tx_hash: row.tx_hash ?? null,
+      raw_source: row.source === "poll" ? "activity" : "webhook",
+      source_stage: row.source_stage ?? null,
+      pending_seen_at: row.pending_seen_at ?? null,
+      mined_seen_at: row.mined_seen_at ?? null,
+      decoded_at: row.decoded_at ?? null,
+      reconcile_status: row.reconcile_status ?? null,
+    };
+
+    const storedFinalStatus = typeof row.final_status === "string" && row.final_status.trim()
+      ? row.final_status
+      : row.status;
+    const finalStatus = normalizeMarketLikeLifecycleStatus(storedFinalStatus, row.order_kind);
+    const marketKey = resolveMarketKey(monitorEvent);
+    const openOrderKey = resolveSessionOpenOrderKey(monitorEvent, typeof row.side === "string" ? row.side : null);
+
+    if (session.config.mode === "buy-wait" && marketKey && shouldConsumeBuyWaitSlot(finalStatus)) {
+      rebuiltMarketBuyCounts[marketKey] = (rebuiltMarketBuyCounts[marketKey] || 0) + 1;
+    }
+
+    if (!openOrderKey) continue;
+    if (isOpenOrderLifecycleStatus(finalStatus)) {
+      rebuiltOpenOrderKeys[openOrderKey] = {
+        requestId: typeof row.request_id === "string" && row.request_id.trim() ? row.request_id.trim() : row.id,
+        orderId: typeof row.open_order_id === "string" && row.open_order_id.trim() ? row.open_order_id.trim() : null,
+        openedAt: row.order_posted_at ?? row.created_at,
+        marketKey: marketKey ?? "unknown",
+        outcomeKey: resolveOutcomeKey(monitorEvent),
+        side: typeof row.side === "string" ? row.side.trim().toUpperCase() : "BUY",
+        status: finalStatus.trim().toLowerCase(),
+      };
+    } else {
+      delete rebuiltOpenOrderKeys[openOrderKey];
+    }
+  }
+
+  if (session.config.mode === "buy-wait") {
+    session.marketBuyCounts = rebuiltMarketBuyCounts;
+  }
+  session.openOrderKeys = rebuiltOpenOrderKeys;
 };
 
 const resolveEventTradeUsd = (event: RuntimeNormalizedEvent, fallbackUsd: number): number => {
@@ -1138,6 +1373,7 @@ const appendSessionEventKey = (session: BackendCopySession, key: string) => {
     const oldest = session.processedQueue.shift();
     if (oldest) session.processedEventKeys.delete(oldest);
   }
+  persistCopySessionsSafe();
   return true;
 };
 
@@ -1633,7 +1869,11 @@ const executeRealTradeOrder = async (raw: RealTradeOrderRequest) => {
   if (status === "matched") {
     resultIcon = "✅";
   } else if (status === "live") {
-    if (useSlippage && openOrderId) {
+    if (orderKind === "market-like") {
+      status = "matched";
+      finalStatus = "matched";
+      resultIcon = "✅";
+    } else if (openOrderId) {
       await sleep(LIVE_ORDER_CANCEL_AFTER_MS);
 
       try {
@@ -1970,10 +2210,6 @@ async function processDetectedEventsBatch(batch: DetectedEventsBatch): Promise<v
   if (batch.isInitialSync) return;
   const walletAddress = trackerRuntime.normalizeWallet(batch.wallet ?? "");
   if (!walletAddress || !Array.isArray(batch.events) || batch.events.length === 0) return;
-  if (batch.source === "poll") {
-    const latestEvent = batch.events.at(-1);
-    console.log(`[poll] wallet=${walletAddress} new=${batch.events.length} latest_seen=${latestEvent?.seen_at_utc ?? "-"}`);
-  }
   await processCopySessionsForWalletEvents(walletAddress, batch.events, { source: batch.source });
 }
 
@@ -1983,35 +2219,234 @@ const listCopySessionsPayload = () => ({
     addressId: session.addressId,
     walletAddress: session.walletAddress,
     strategy: session.strategy,
+    config: session.config,
     status: session.status,
     startedAt: session.startedAt,
     processedCount: session.processedCount,
     copiedCount: session.copiedCount,
     failedCount: session.failedCount,
+    marketBuyCounts: session.marketBuyCounts,
+    openOrderKeys: session.openOrderKeys,
   })),
 });
 
-const getAllOrderHistory = (limit: number, walletFilter?: string) => {
+const toTrimmedText = (value: unknown): string | null => {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+};
+
+const isPlaceholderHistoryMarket = (value: string | null) => {
+  if (!value) return true;
+  const normalized = value.trim().toLowerCase();
+  return !normalized || normalized === "-" || normalized.startsWith("asset-");
+};
+
+const isPlaceholderHistoryOutcome = (value: string | null) => {
+  if (!value) return true;
+  const normalized = value.trim().toLowerCase();
+  return !normalized || normalized === "-" || normalized === "unknown";
+};
+
+type OrderHistoryMeta = {
+  market: string | null;
+  marketSlug: string | null;
+  outcome: string | null;
+};
+
+const mergeOrderHistoryMeta = (base: OrderHistoryMeta, candidate: OrderHistoryMeta): OrderHistoryMeta => ({
+  market: !isPlaceholderHistoryMarket(base.market) ? base.market : candidate.market,
+  marketSlug: !isPlaceholderHistoryMarket(base.marketSlug) ? base.marketSlug : candidate.marketSlug,
+  outcome: !isPlaceholderHistoryOutcome(base.outcome) ? base.outcome : candidate.outcome,
+});
+
+const enrichHistoryPayloadMeta = (
+  payload: Record<string, unknown> | null | undefined,
+  meta: OrderHistoryMeta,
+): Record<string, unknown> | null | undefined => {
+  if (!payload) return payload;
+
+  const nextPayload: Record<string, unknown> = { ...payload };
+
+  const payloadMarketSlug = toTrimmedText(nextPayload.marketSlug);
+  if (isPlaceholderHistoryMarket(payloadMarketSlug) && meta.marketSlug) nextPayload.marketSlug = meta.marketSlug;
+
+  const payloadMarket = toTrimmedText(nextPayload.market);
+  if (isPlaceholderHistoryMarket(payloadMarket) && meta.market) nextPayload.market = meta.market;
+
+  const payloadOutcome = toTrimmedText(nextPayload.outcome);
+  if (isPlaceholderHistoryOutcome(payloadOutcome) && meta.outcome) nextPayload.outcome = meta.outcome;
+
+  const script = nextPayload.script;
+  if (script && typeof script === "object") {
+    const nextScript = { ...(script as Record<string, unknown>) };
+    const place = nextScript.place;
+    if (place && typeof place === "object") {
+      const nextPlace = { ...(place as Record<string, unknown>) };
+      const placeMarketSlug = toTrimmedText(nextPlace.marketSlug);
+      if (isPlaceholderHistoryMarket(placeMarketSlug) && meta.marketSlug) nextPlace.marketSlug = meta.marketSlug;
+      const placeMarket = toTrimmedText(nextPlace.market);
+      if (isPlaceholderHistoryMarket(placeMarket) && meta.market) nextPlace.market = meta.market;
+      const placeOutcome = toTrimmedText(nextPlace.outcome);
+      if (isPlaceholderHistoryOutcome(placeOutcome) && meta.outcome) nextPlace.outcome = meta.outcome;
+      nextScript.place = nextPlace;
+    }
+    nextPayload.script = nextScript;
+  }
+
+  return nextPayload;
+};
+
+const buildOrderHistoryMetaLookup = (rows: TrackerMonitorRecord[]) => {
+  const byTxAssetSide = new Map<string, OrderHistoryMeta>();
+  const byTxAsset = new Map<string, OrderHistoryMeta>();
+  const byAssetSide = new Map<string, OrderHistoryMeta>();
+
+  for (const row of rows) {
+    if (row.kind !== "event") continue;
+
+    const market = toTrimmedText(row.market);
+    const marketSlug = toTrimmedText(row.market_slug);
+    const outcome = toTrimmedText(row.outcome);
+    const meta: OrderHistoryMeta = { market, marketSlug, outcome };
+
+    if (isPlaceholderHistoryMarket(meta.market) && isPlaceholderHistoryMarket(meta.marketSlug) && isPlaceholderHistoryOutcome(meta.outcome)) {
+      continue;
+    }
+
+    const txHash = toTrimmedText(row.tx_hash)?.toLowerCase() ?? "";
+    const assetId = toTrimmedText(row.asset_id) ?? "";
+    const side = toTrimmedText(row.side)?.toUpperCase() ?? "";
+
+    const assignMeta = (map: Map<string, OrderHistoryMeta>, key: string) => {
+      if (!key) return;
+      const existing = map.get(key);
+      map.set(key, existing ? mergeOrderHistoryMeta(existing, meta) : meta);
+    };
+
+    assignMeta(byTxAssetSide, `${txHash}|${assetId}|${side}`);
+    assignMeta(byTxAsset, `${txHash}|${assetId}`);
+    assignMeta(byAssetSide, `${assetId}|${side}`);
+  }
+
+  return { byTxAssetSide, byTxAsset, byAssetSide };
+};
+
+const enrichOrderHistoryRow = (
+  row: TrackerMonitorRecord,
+  lookup: ReturnType<typeof buildOrderHistoryMetaLookup>,
+): TrackerMonitorRecord => {
+  const effectiveStatus = getEffectiveHistoryStatus(row);
+  const effectiveFinalStatus = getEffectiveHistoryFinalStatus(row);
+  const txHash = toTrimmedText(row.tx_hash)?.toLowerCase() ?? "";
+  const assetId = toTrimmedText(row.asset_id) ?? "";
+  const side = toTrimmedText(row.side)?.toUpperCase() ?? "";
+
+  const meta = lookup.byTxAssetSide.get(`${txHash}|${assetId}|${side}`)
+    || lookup.byTxAsset.get(`${txHash}|${assetId}`)
+    || lookup.byAssetSide.get(`${assetId}|${side}`);
+
+  if (!meta) {
+    return {
+      ...row,
+      status: effectiveStatus,
+      final_status: effectiveFinalStatus,
+    };
+  }
+
+  const nextRow: TrackerMonitorRecord = {
+    ...row,
+    status: effectiveStatus,
+    final_status: effectiveFinalStatus,
+    market: !isPlaceholderHistoryMarket(toTrimmedText(row.market))
+      ? row.market
+      : (meta.market ?? meta.marketSlug ?? row.market),
+    market_slug: !isPlaceholderHistoryMarket(toTrimmedText(row.market_slug))
+      ? row.market_slug
+      : (meta.marketSlug ?? meta.market ?? row.market_slug),
+    outcome: !isPlaceholderHistoryOutcome(toTrimmedText(row.outcome))
+      ? row.outcome
+      : (meta.outcome ?? row.outcome),
+    request_payload: enrichHistoryPayloadMeta(row.request_payload, meta),
+    response_payload: enrichHistoryPayloadMeta(row.response_payload, meta),
+  };
+
+  return nextRow;
+};
+
+type OrderHistoryFilterStatus = "all" | "matched" | "open" | "cancelled" | "blocked" | "error";
+
+const normalizeOrderHistoryFilterStatus = (value: string | null | undefined): OrderHistoryFilterStatus => {
+  const normalized = (value ?? "").trim().toLowerCase();
+  if (normalized === "matched" || normalized === "open" || normalized === "cancelled" || normalized === "blocked" || normalized === "error") {
+    return normalized;
+  }
+  return "all";
+};
+
+const getAllOrderHistory = (
+  limit: number,
+  walletFilter?: string,
+  walletFilters?: string[],
+  statusFilter: OrderHistoryFilterStatus = "all",
+) => {
   const normalizedFilter = (walletFilter ?? "").trim().toLowerCase();
+  const normalizedWalletFilters = new Set(
+    (walletFilters ?? [])
+      .map((wallet) => wallet.trim().toLowerCase())
+      .filter(Boolean),
+  );
   const wallets = trackerRuntime.listWallets()
     .map((item) => item.address)
-    .filter((address) => !normalizedFilter || address === normalizedFilter);
+    .filter((address) => {
+      if (normalizedWalletFilters.size > 0) return normalizedWalletFilters.has(address);
+      if (normalizedFilter) return address === normalizedFilter;
+      return true;
+    });
 
   const rows = wallets
-    .flatMap((address) => trackerRuntime.getMonitor(address, Math.max(limit * 2, 500)))
-    .filter((row) => row.kind === "order")
+    .flatMap((address) => {
+      const monitorRows = trackerRuntime.getMonitor(address, Math.max(limit * 4, 1000));
+      const metaLookup = buildOrderHistoryMetaLookup(monitorRows);
+      return monitorRows
+        .filter((row) => row.kind === "order")
+        .map((row) => enrichOrderHistoryRow(row, metaLookup));
+    })
+    .filter((row) => {
+      if (statusFilter === "all") return true;
+      const effectiveStatus = getEffectiveHistoryStatus(row);
+      if (statusFilter === "matched") return effectiveStatus === "matched";
+      if (statusFilter === "open") return effectiveStatus === "live_open" || effectiveStatus === "live";
+      if (statusFilter === "cancelled") return effectiveStatus === "cancelled_after_timeout";
+      if (statusFilter === "blocked") return effectiveStatus === "blocked";
+      if (statusFilter === "error") return effectiveStatus === "error";
+      return true;
+    })
     .sort((a, b) => (Date.parse(b.created_at) || 0) - (Date.parse(a.created_at) || 0))
     .slice(0, limit);
 
   return rows;
 };
 
+const getEffectiveHistoryStatus = (row: TrackerMonitorRecord) => {
+  const status = typeof row.status === "string" ? row.status : "";
+  const orderKind = typeof row.order_kind === "string" ? row.order_kind : null;
+  return normalizeMarketLikeLifecycleStatus(status, orderKind);
+};
+
+const getEffectiveHistoryFinalStatus = (row: TrackerMonitorRecord) => {
+  const finalStatus = typeof row.final_status === "string" && row.final_status.trim()
+    ? row.final_status
+    : row.status;
+  const orderKind = typeof row.order_kind === "string" ? row.order_kind : null;
+  return normalizeMarketLikeLifecycleStatus(finalStatus, orderKind);
+};
+
 const getOrderStats = (rows: TrackerMonitorRecord[]) => {
   const total = rows.length;
-  const matched = rows.filter((row) => row.status === "matched").length;
-  const open = rows.filter((row) => row.status === "live_open" || row.status === "live").length;
-  const cancelled = rows.filter((row) => row.status === "cancelled_after_timeout").length;
-  const failed = rows.filter((row) => row.status === "error" || row.status === "blocked").length;
+  const matched = rows.filter((row) => getEffectiveHistoryStatus(row) === "matched").length;
+  const open = rows.filter((row) => getEffectiveHistoryStatus(row) === "live_open" || getEffectiveHistoryStatus(row) === "live").length;
+  const cancelled = rows.filter((row) => getEffectiveHistoryStatus(row) === "cancelled_after_timeout").length;
+  const blocked = rows.filter((row) => getEffectiveHistoryStatus(row) === "blocked").length;
+  const failed = rows.filter((row) => getEffectiveHistoryStatus(row) === "error").length;
   const applied = matched;
   const unapplied = cancelled + failed;
   const pending = open;
@@ -2024,6 +2459,7 @@ const getOrderStats = (rows: TrackerMonitorRecord[]) => {
     matched,
     open,
     cancelled,
+    blocked,
     failed,
     applied,
     unapplied,
@@ -2106,7 +2542,7 @@ const getLatencyBreakdown = (rows: TrackerMonitorRecord[]) => {
 
 const appendOrderMonitor = (args: {
   wallet: string;
-  source: "ui" | "webhook";
+  source: "ui" | "webhook" | "ws" | "poll";
   requestId: string;
   event: RuntimeNormalizedEvent;
   status: string;
@@ -2190,11 +2626,14 @@ const processSessionEvent = async (
   const eventKey = resolveEventKey(event);
   if (!appendSessionEventKey(session, eventKey)) return;
   session.processedCount += 1;
+  persistCopySessionsSafe();
 
   const side = normalizeSideValue(event.side);
   const price = toPositiveFiniteNumber(event.price);
   const size = toPositiveFiniteNumber(event.size);
   if (!side || price === null || size === null) return;
+  const marketKey = resolveMarketKey(event);
+  const openOrderKey = resolveSessionOpenOrderKey(event, side);
 
   if (session.config.mode === "buy-wait" && side !== "BUY") {
     appendOrderMonitor({
@@ -2267,7 +2706,6 @@ const processSessionEvent = async (
   }
 
   if (session.config.mode === "buy-wait") {
-    const marketKey = resolveMarketKey(event);
     if (!marketKey) {
       appendOrderMonitor({
         wallet: session.walletAddress,
@@ -2298,6 +2736,39 @@ const processSessionEvent = async (
         error: "buy-wait limit doldu",
         requestPayload: null,
         responsePayload: { ok: false, status: "blocked", error: "buy_wait_limit" },
+        detectedAt: normalizeIsoTimestamp(event.seen_at_utc),
+        postedAt: utcNowIso(),
+        detectToOrderMs: null,
+        attemptCount: null,
+        webhookReceivedAt: options.webhookReceivedAt ?? null,
+        decodedAt: options.decodedAt ?? null,
+      });
+      return;
+    }
+  }
+
+  if (openOrderKey) {
+    const existingOpenOrder = session.openOrderKeys[openOrderKey];
+    if (existingOpenOrder) {
+      appendOrderMonitor({
+        wallet: session.walletAddress,
+        source,
+        requestId: crypto.randomUUID(),
+        event,
+        status: "blocked",
+        error: "Ayni market/outcome icin acik emir zaten var",
+        requestPayload: null,
+        responsePayload: {
+          ok: false,
+          status: "blocked",
+          error: "open_order_exists",
+          details: {
+            requestId: existingOpenOrder.requestId,
+            orderId: existingOpenOrder.orderId,
+            openedAt: existingOpenOrder.openedAt,
+            side: existingOpenOrder.side,
+          },
+        },
         detectedAt: normalizeIsoTimestamp(event.seen_at_utc),
         postedAt: utcNowIso(),
         detectToOrderMs: null,
@@ -2355,6 +2826,7 @@ const processSessionEvent = async (
 
   const detectedAt = normalizeIsoTimestamp(event.seen_at_utc);
   session.status = "syncing";
+  persistCopySessionsSafe();
 
   try {
     const response = await enqueueOrderJob(session.walletAddress, async () => executeRealTradeOrder({
@@ -2375,6 +2847,10 @@ const processSessionEvent = async (
     })) as Record<string, unknown>;
 
     const status = typeof response.status === "string" ? response.status : "error";
+    const finalStatus = typeof response.finalStatus === "string" ? response.finalStatus : status;
+    const responseOpenOrderId = typeof response.openOrderId === "string" && response.openOrderId.trim()
+      ? response.openOrderId.trim()
+      : null;
     appendOrderMonitor({
       wallet: session.walletAddress,
       source,
@@ -2395,14 +2871,29 @@ const processSessionEvent = async (
       `[order] wallet=${session.walletAddress} status=${status} latency_ms=${typeof response.detectToOrderMs === "number" ? response.detectToOrderMs : "na"} source=${source} market=${marketSlug || event.market || "-"}`,
     );
 
+    if (openOrderKey) {
+      if (isOpenOrderLifecycleStatus(finalStatus)) {
+        session.openOrderKeys[openOrderKey] = {
+          requestId,
+          orderId: responseOpenOrderId,
+          openedAt: typeof response.postedAt === "string" ? response.postedAt : utcNowIso(),
+          marketKey: marketKey ?? "unknown",
+          outcomeKey: resolveOutcomeKey(event),
+          side,
+          status: finalStatus,
+        };
+      } else {
+        delete session.openOrderKeys[openOrderKey];
+      }
+    }
+
     if (status === "matched") {
       session.copiedCount += 1;
-      if (session.config.mode === "buy-wait") {
-        const marketKey = resolveMarketKey(event);
-        if (marketKey) session.marketBuyCounts[marketKey] = (session.marketBuyCounts[marketKey] || 0) + 1;
-      }
-    } else {
+    } else if (finalStatus === "error" || finalStatus === "cancelled_after_timeout") {
       session.failedCount += 1;
+    }
+    if (session.config.mode === "buy-wait" && marketKey && shouldConsumeBuyWaitSlot(finalStatus)) {
+      session.marketBuyCounts[marketKey] = (session.marketBuyCounts[marketKey] || 0) + 1;
     }
   } catch (error) {
     session.failedCount += 1;
@@ -2434,6 +2925,7 @@ const processSessionEvent = async (
     );
   } finally {
     session.status = "running";
+    persistCopySessionsSafe();
   }
 };
 
@@ -2683,6 +3175,7 @@ const createPolymarketTrackerPlugin = (): Plugin => ({
   configureServer(server) {
     fs.mkdirSync(TRACKING_ROOT, { recursive: true });
     fs.mkdirSync(PROFILE_TRADES_ROOT, { recursive: true });
+    restoreCopySessions();
 
     for (const wallet of trackerRuntime.listWallets()) {
       trackerRuntime.startTracker(wallet.address);
@@ -2783,10 +3276,12 @@ const createPolymarketTrackerPlugin = (): Plugin => ({
             copiedCount: 0,
             failedCount: 0,
             startAfterMs: Date.now(),
+            openOrderKeys: {},
           };
           trackerRuntime.startTracker(walletAddress);
           trackerRuntime.triggerImmediateRefresh(walletAddress);
           copySessions.set(sessionId, session);
+          persistCopySessionsSafe();
           sendJson(200, { ok: true, session: listCopySessionsPayload().sessions.find((item) => item.sessionId === sessionId) });
           return;
         }
@@ -2797,6 +3292,7 @@ const createPolymarketTrackerPlugin = (): Plugin => ({
           const strategy = normalizeStrategyName(parsed.strategy);
           const sessionId = buildSessionId(addressId, strategy);
           const stopped = copySessions.delete(sessionId);
+          persistCopySessionsSafe();
           sendJson(200, { ok: true, sessionId, stopped });
           return;
         }
@@ -2839,7 +3335,12 @@ const createPolymarketTrackerPlugin = (): Plugin => ({
             ? Math.min(rawLimit, 1000)
             : HISTORY_DEFAULT_LIMIT;
           const wallet = requestUrl.searchParams.get("wallet") ?? "";
-          const rows = getAllOrderHistory(limit, wallet);
+          const wallets = requestUrl.searchParams.get("wallets");
+          const walletFilters = wallets
+            ? wallets.split(",").map((item) => trackerRuntime.normalizeWallet(item)).filter(Boolean)
+            : [];
+          const status = normalizeOrderHistoryFilterStatus(requestUrl.searchParams.get("status"));
+          const rows = getAllOrderHistory(limit, wallet, walletFilters, status);
           sendJson(200, { records: rows });
           return;
         }
@@ -3156,8 +3657,9 @@ ${context}`;
 
         if (req.method === "DELETE" && req.url?.startsWith("/api/tracker/")) {
           const address = trackerRuntime.normalizeWallet(req.url.replace("/api/tracker/", "").split("?")[0]);
+          const removedSessions = removeCopySessionsForWallet(address);
           trackerRuntime.removeTrackerData(address);
-          sendJson(200, { ok: true, address, deletedPath: trackerRuntime.walletDir(address) });
+          sendJson(200, { ok: true, address, removedSessions, deletedPath: trackerRuntime.walletDir(address) });
           return;
         }
 
@@ -3173,7 +3675,7 @@ ${context}`;
 export default defineConfig(({ mode }) => ({
   server: {
     host: "::",
-    port: 8080,
+    port: 244,
     allowedHosts: true,
     hmr: {
       overlay: false,

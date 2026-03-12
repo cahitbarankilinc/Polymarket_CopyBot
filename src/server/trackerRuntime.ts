@@ -303,13 +303,20 @@ export const createTrackerRuntimeManager = (options: TrackerRuntimeManagerOption
   const eventsFile = (address: string) => path.join(walletDir(address), "events.ndjson");
   const monitorFile = (address: string) => path.join(walletDir(address), "monitor.ndjson");
   const errorsFile = (address: string) => path.join(walletDir(address), "errors.log");
+  const orderArchiveCsvFile = () => path.join(trackingRoot, "_order_history_archive.csv");
+  const walletStorageExists = (address: string) => fs.existsSync(walletDir(address));
 
   const ensureWalletDir = (address: string) => {
     fs.mkdirSync(walletDir(address), { recursive: true });
   };
 
   const appendError = (address: string, message: string) => {
-    fs.appendFileSync(errorsFile(address), `[${utcNowIso()}] ${message}\n`, "utf-8");
+    try {
+      if (!walletStorageExists(address)) return;
+      fs.appendFileSync(errorsFile(address), `[${utcNowIso()}] ${message}\n`, "utf-8");
+    } catch {
+      // Swallow logging failures so runtime cleanup cannot crash the server.
+    }
   };
 
   const readState = (address: string): TrackerState => {
@@ -327,6 +334,7 @@ export const createTrackerRuntimeManager = (options: TrackerRuntimeManagerOption
   };
 
   const writeState = (address: string, state: TrackerState) => {
+    if (!walletStorageExists(address)) return;
     fs.writeFileSync(stateFile(address), JSON.stringify(state, null, 2), "utf-8");
   };
 
@@ -344,8 +352,103 @@ export const createTrackerRuntimeManager = (options: TrackerRuntimeManagerOption
 
   const appendNdjson = (targetFile: string, rows: unknown[]) => {
     if (rows.length === 0) return;
+    if (!fs.existsSync(path.dirname(targetFile))) return;
     const payload = rows.map((row) => JSON.stringify(row)).join("\n");
     fs.appendFileSync(targetFile, `${payload}\n`, "utf-8");
+  };
+
+  const csvEscape = (value: unknown): string => {
+    if (value === null || value === undefined) return "";
+    const text = typeof value === "string"
+      ? value
+      : typeof value === "number" || typeof value === "boolean"
+        ? String(value)
+        : JSON.stringify(value);
+    const escaped = text.replace(/"/g, '""');
+    return `"${escaped}"`;
+  };
+
+  const ORDER_ARCHIVE_COLUMNS = [
+    "created_at",
+    "wallet",
+    "source",
+    "tx_hash",
+    "market",
+    "market_slug",
+    "outcome",
+    "asset_id",
+    "side",
+    "price",
+    "size",
+    "value_usd",
+    "status",
+    "final_status",
+    "error",
+    "detected_at",
+    "order_posted_at",
+    "detect_to_order_ms",
+    "attempt_count",
+    "order_kind",
+    "order_type",
+    "quantity_kind",
+    "open_order_id",
+    "cancelled_at",
+    "request_id",
+    "source_stage",
+    "pending_seen_at",
+    "mined_seen_at",
+    "decoded_at",
+    "reconcile_status",
+    "request_payload_json",
+    "response_payload_json",
+  ] as const;
+
+  const appendOrderArchiveCsv = (entries: TrackerMonitorRecord[]) => {
+    const rows = entries.filter((entry) => entry.kind === "order");
+    if (!rows.length) return;
+    fs.mkdirSync(trackingRoot, { recursive: true });
+    const target = orderArchiveCsvFile();
+    if (!fs.existsSync(target)) {
+      fs.writeFileSync(target, `${ORDER_ARCHIVE_COLUMNS.join(",")}\n`, "utf-8");
+    }
+    const payload = rows.map((row) => {
+      const values = [
+        row.created_at,
+        row.wallet,
+        row.source,
+        row.tx_hash ?? "",
+        row.market ?? "",
+        row.market_slug ?? "",
+        row.outcome ?? "",
+        row.asset_id ?? "",
+        row.side ?? "",
+        row.price ?? "",
+        row.size ?? "",
+        row.value_usd ?? "",
+        row.status,
+        row.final_status ?? "",
+        row.error ?? "",
+        row.detected_at ?? "",
+        row.order_posted_at ?? "",
+        row.detect_to_order_ms ?? "",
+        row.attempt_count ?? "",
+        row.order_kind ?? "",
+        row.order_type ?? "",
+        row.quantity_kind ?? "",
+        row.open_order_id ?? "",
+        row.cancelled_at ?? "",
+        row.request_id ?? "",
+        row.source_stage ?? "",
+        row.pending_seen_at ?? "",
+        row.mined_seen_at ?? "",
+        row.decoded_at ?? "",
+        row.reconcile_status ?? "",
+        row.request_payload ?? null,
+        row.response_payload ?? null,
+      ];
+      return values.map((value) => csvEscape(value)).join(",");
+    }).join("\n");
+    fs.appendFileSync(target, `${payload}\n`, "utf-8");
   };
 
   const readEvents = (address: string, limit?: number): NormalizedEvent[] => readNdjson<NormalizedEvent>(eventsFile(address), limit);
@@ -355,6 +458,7 @@ export const createTrackerRuntimeManager = (options: TrackerRuntimeManagerOption
 
   const appendMonitor = (address: string, entries: TrackerMonitorRecord[]) => {
     appendNdjson(monitorFile(address), entries);
+    appendOrderArchiveCsv(entries);
   };
 
   const clearOrderHistory = (address: string) => {
@@ -769,11 +873,6 @@ export const createTrackerRuntimeManager = (options: TrackerRuntimeManagerOption
         appendDetectedEvents(runtime, newEvents, "poll", isInitialSync);
       }
 
-      const elapsedMs = Date.now() - startedAt;
-      console.log(
-        `[poll-cycle] wallet=${runtime.address} activity=${activity.length} trades=${trades.length} new=${newEvents.length} duration_ms=${elapsedMs}`,
-      );
-
       runtime.state.seen_ids = [...seenIds];
       runtime.state.seen_queue = seenQueue;
       runtime.state.last_check = utcNowIso();
@@ -1030,6 +1129,7 @@ export const createTrackerRuntimeManager = (options: TrackerRuntimeManagerOption
 
     ws.on("error", (error) => {
       runtime.status.wsConnected = false;
+      if (!runtime.active) return;
       appendError(runtime.address, `ws error: ${error instanceof Error ? error.message : String(error)}`);
     });
 
@@ -1039,8 +1139,8 @@ export const createTrackerRuntimeManager = (options: TrackerRuntimeManagerOption
       runtime.wsSubIds.pending = null;
       runtime.wsSubIds.logs.clear();
       const reasonText = typeof reason === "string" ? reason : Buffer.isBuffer(reason) ? reason.toString("utf-8") : "";
-      appendError(runtime.address, `ws close: code=${code}${reasonText ? ` reason=${reasonText}` : ""}`);
       if (!runtime.active) return;
+      appendError(runtime.address, `ws close: code=${code}${reasonText ? ` reason=${reasonText}` : ""}`);
       if (runtime.wsReconnectTimer) clearTimeout(runtime.wsReconnectTimer);
       if (wsProviders.length > 0) {
         runtime.wsProviderIndex = (runtime.wsProviderIndex + 1) % wsProviders.length;
