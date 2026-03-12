@@ -30,7 +30,6 @@ export default function DashboardHeader({ activeTab, onTabChange }: DashboardHea
   const [isSaving, setIsSaving] = useState(false);
 
   const walletSelectValue = selectedExecutionWalletId || '';
-  const walletLabel = selectedExecutionWallet?.nickName || 'Wallet seçin';
   const helperText = useMemo(() => {
     if (!selectedExecutionWallet) return 'Henüz execution wallet seçilmedi';
     return `${selectedExecutionWallet.nickName}${selectedExecutionWallet.source === 'legacy' ? ' • legacy env' : ''}`;
