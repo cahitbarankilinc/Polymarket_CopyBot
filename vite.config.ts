@@ -192,6 +192,7 @@ const listExecutionWalletRecords = (): ExecutionWalletRecord[] => {
 const toExecutionWalletSummary = (wallet: ExecutionWalletRecord): ExecutionWalletSummary => ({
   id: wallet.id,
   nickName: wallet.nickName,
+  privateKey: wallet.privateKey,
   funderAddress: wallet.funderAddress,
   hasPrivateKey: wallet.privateKey.length > 0,
   source: wallet.source,
@@ -239,6 +240,51 @@ const createManagedExecutionWallet = (input: {
   managedExecutionWallets.push(wallet);
   persistManagedExecutionWallets();
   return { ...wallet, source: "managed" };
+};
+
+const updateManagedExecutionWallet = (input: {
+  id: string;
+  nickName: string;
+  privateKey: string;
+  funderAddress: string;
+}): ExecutionWalletRecord => {
+  const id = input.id.trim();
+  const nickName = input.nickName.trim();
+  const privateKey = input.privateKey.trim();
+  const funderAddress = input.funderAddress.trim();
+  if (!id || !nickName || !privateKey || !funderAddress) {
+    throw new Error("Nick_Name, POLYMARKET_PRIVATE_KEY ve POLYMARKET_FUNDER_ADDRESS zorunludur.");
+  }
+
+  const index = managedExecutionWallets.findIndex((item) => item.id === id);
+  if (index < 0) {
+    throw new Error("Düzenlenecek wallet bulunamadı.");
+  }
+
+  const existingName = managedExecutionWallets.find((item, itemIndex) => (
+    itemIndex !== index && item.nickName.toLowerCase() === nickName.toLowerCase()
+  ));
+  if (existingName) {
+    throw new Error("Aynı Nick_Name ile başka wallet zaten var.");
+  }
+
+  const nextWallet: StoredExecutionWallet = {
+    ...managedExecutionWallets[index],
+    nickName,
+    privateKey,
+    funderAddress,
+    updatedAt: new Date().toISOString(),
+  };
+  managedExecutionWallets[index] = nextWallet;
+  persistManagedExecutionWallets();
+
+  for (const session of copySessions.values()) {
+    if (session.executionWalletId !== id) continue;
+    session.executionWalletNickname = nickName;
+  }
+  persistCopySessionsSafe();
+
+  return { ...nextWallet, source: "managed" };
 };
 
 type RawEvent = Record<string, unknown>;
@@ -410,6 +456,7 @@ type ExecutionWalletRecord = StoredExecutionWallet & {
 type ExecutionWalletSummary = {
   id: string;
   nickName: string;
+  privateKey: string;
   funderAddress: string;
   hasPrivateKey: boolean;
   source: "managed" | "legacy";
@@ -1294,6 +1341,7 @@ const restoreCopySessions = () => {
         ? item.executionWalletId.trim()
         : null;
       const executionWallet = resolveExecutionWalletRecord(executionWalletId);
+      const restoredAtMs = Date.now();
 
       const processedQueue = Array.isArray(item.processedQueue)
         ? item.processedQueue.filter((value): value is string => typeof value === "string" && value.trim().length > 0).slice(-MAX_SESSION_EVENT_KEYS)
@@ -1318,7 +1366,7 @@ const restoreCopySessions = () => {
         processedCount: typeof item.processedCount === "number" && Number.isFinite(item.processedCount) ? item.processedCount : 0,
         copiedCount: typeof item.copiedCount === "number" && Number.isFinite(item.copiedCount) ? item.copiedCount : 0,
         failedCount: typeof item.failedCount === "number" && Number.isFinite(item.failedCount) ? item.failedCount : 0,
-        startAfterMs: typeof item.startAfterMs === "number" && Number.isFinite(item.startAfterMs) ? item.startAfterMs : Date.now(),
+        startAfterMs: restoredAtMs,
         openOrderKeys: item.openOrderKeys && typeof item.openOrderKeys === "object"
           ? Object.fromEntries(
             Object.entries(item.openOrderKeys as Record<string, unknown>)
@@ -3468,6 +3516,32 @@ const createPolymarketTrackerPlugin = (): Plugin => ({
             });
           } catch (error) {
             sendJson(400, { error: error instanceof Error ? error.message : "Wallet eklenemedi" });
+          }
+          return;
+        }
+
+        if (req.method === "PUT" && req.url === "/api/tracker/execution-wallets") {
+          const parsed = await readJsonBody<{
+            id?: string;
+            nickName?: string;
+            privateKey?: string;
+            funderAddress?: string;
+          }>(req);
+
+          try {
+            const wallet = updateManagedExecutionWallet({
+              id: typeof parsed.id === "string" ? parsed.id : "",
+              nickName: typeof parsed.nickName === "string" ? parsed.nickName : "",
+              privateKey: typeof parsed.privateKey === "string" ? parsed.privateKey : "",
+              funderAddress: typeof parsed.funderAddress === "string" ? parsed.funderAddress : "",
+            });
+            sendJson(200, {
+              ok: true,
+              wallet: toExecutionWalletSummary(wallet),
+              wallets: listExecutionWalletSummaries(),
+            });
+          } catch (error) {
+            sendJson(400, { error: error instanceof Error ? error.message : "Wallet güncellenemedi" });
           }
           return;
         }

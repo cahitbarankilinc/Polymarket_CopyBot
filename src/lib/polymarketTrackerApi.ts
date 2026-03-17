@@ -287,6 +287,7 @@ export type BackendCopySession = {
 export type ExecutionWalletSummary = {
   id: string;
   nickName: string;
+  privateKey: string;
   funderAddress: string;
   hasPrivateKey: boolean;
   source: 'managed' | 'legacy';
@@ -486,6 +487,24 @@ export async function createExecutionWallet(payload: {
   if (!response.ok) {
     const text = await response.text();
     throw new Error(text || 'Execution wallet eklenemedi');
+  }
+  return response.json() as Promise<{ ok: true; wallet: ExecutionWalletSummary; wallets: ExecutionWalletSummary[] }>;
+}
+
+export async function updateExecutionWallet(payload: {
+  id: string;
+  nickName: string;
+  privateKey: string;
+  funderAddress: string;
+}): Promise<{ ok: true; wallet: ExecutionWalletSummary; wallets: ExecutionWalletSummary[] }> {
+  const response = await fetch('/api/tracker/execution-wallets', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(text || 'Execution wallet güncellenemedi');
   }
   return response.json() as Promise<{ ok: true; wallet: ExecutionWalletSummary; wallets: ExecutionWalletSummary[] }>;
 }

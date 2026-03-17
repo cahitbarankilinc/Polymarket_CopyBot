@@ -3,6 +3,7 @@ import {
   createExecutionWallet,
   listExecutionWallets,
   startWalletTracking,
+  updateExecutionWallet as updateExecutionWalletApi,
   type ExecutionWalletSummary,
 } from '@/lib/polymarketTrackerApi';
 
@@ -89,6 +90,7 @@ interface DashboardContextType {
   selectExecutionWallet: (walletId: string | null) => void;
   refreshExecutionWallets: () => Promise<void>;
   addExecutionWallet: (payload: { nickName: string; privateKey: string; funderAddress: string }) => Promise<ExecutionWalletSummary>;
+  updateExecutionWallet: (payload: { id: string; nickName: string; privateKey: string; funderAddress: string }) => Promise<ExecutionWalletSummary>;
   addToPaperTrade: (addressId: string) => void;
   setPaperBudget: (config: { mode: 'unlimited' | 'limited'; type: 'daily' | 'total'; amount: number }) => void;
   startPaperTrade: (addressId: string, input: StartPaperTradeInput) => { ok: boolean; reason?: string };
@@ -245,6 +247,14 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
     return response.wallet;
   }, [selectExecutionWallet]);
 
+  const updateExecutionWallet = useCallback(async (payload: { id: string; nickName: string; privateKey: string; funderAddress: string }) => {
+    const response = await updateExecutionWalletApi(payload);
+    const wallets = Array.isArray(response.wallets) ? response.wallets : [];
+    setExecutionWallets(wallets);
+    selectExecutionWallet(response.wallet.id);
+    return response.wallet;
+  }, [selectExecutionWallet]);
+
   const addToPaperTrade = useCallback((_addressId: string) => {
     // Already handled - addresses show in paper trade tab
   }, []);
@@ -395,7 +405,7 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
       addresses, categories, paperTrades, paperBudget,
       executionWallets, selectedExecutionWalletId, selectedExecutionWallet,
       addAddress, updateAddressNote, removeAddress, addCategory, addToPaperTrade,
-      selectExecutionWallet, refreshExecutionWallets, addExecutionWallet,
+      selectExecutionWallet, refreshExecutionWallets, addExecutionWallet, updateExecutionWallet,
       setPaperBudget, startPaperTrade, closePaperTrade,
     }}>
       {children}
